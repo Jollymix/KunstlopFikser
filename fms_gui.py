@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import subprocess
 from io import BytesIO
 import random
+import re
 
 
 def decode_xml_bytes(data):
@@ -32,68 +33,86 @@ def is_cancelled(status):
 
 def parse_competition(xml_text, log):
     rows = []
-    root = ET.fromstring(xml_text)
-    comp = root.find("Competition")
-    if comp is None:
-        return rows
+    roots = []
+    try:
+        roots = [ET.fromstring(xml_text)]
+    except ET.ParseError as exc:
+        if "junk after document element" in str(exc):
+            log("XML inneholder flere dokumenter, prøver å hente alle OdfBody.")
+            for match in re.finditer(r"<OdfBody\\b", xml_text):
+                start = match.start()
+                end = xml_text.find("</OdfBody>", start)
+                if end != -1:
+                    chunk = xml_text[start : end + len("</OdfBody>")]
+                    try:
+                        roots.append(ET.fromstring(chunk))
+                    except ET.ParseError:
+                        continue
+        else:
+            raise
 
-    for participant in comp.findall("Participant"):
-        given = (participant.attrib.get("GivenName") or "").strip()
-        family = (participant.attrib.get("FamilyName") or "").strip()
-        print_name = (participant.attrib.get("PrintName") or "").strip()
-        gender = (participant.attrib.get("Gender") or "").strip()
-        org = (participant.attrib.get("Organisation") or "").strip()
-        participant_code = (participant.attrib.get("Code") or "").strip()
+    for root in roots:
+        comp = root.find("Competition")
+        if comp is None:
+            continue
 
-        for discipline in participant.findall("Discipline"):
-            for reg in discipline.findall("RegisteredEvent"):
-                event_code = (reg.attrib.get("Event") or "").strip()
-                entry_order = ""
-                music = {}
-                clubs = {}
-                elements_free = []
-                elements_short = []
+        for participant in comp.findall("Participant"):
+            given = (participant.attrib.get("GivenName") or "").strip()
+            family = (participant.attrib.get("FamilyName") or "").strip()
+            print_name = (participant.attrib.get("PrintName") or "").strip()
+            gender = (participant.attrib.get("Gender") or "").strip()
+            org = (participant.attrib.get("Organisation") or "").strip()
+            participant_code = (participant.attrib.get("Code") or "").strip()
 
-                for entry in reg.findall("EventEntry"):
-                    code = (entry.attrib.get("Code") or "").strip()
-                    pos = safe_int(entry.attrib.get("Pos"))
-                    val = (entry.attrib.get("Value") or "").strip()
+            for discipline in participant.findall("Discipline"):
+                for reg in discipline.findall("RegisteredEvent"):
+                    event_code = (reg.attrib.get("Event") or "").strip()
+                    entry_order = ""
+                    music = {}
+                    clubs = {}
+                    elements_free = []
+                    elements_short = []
 
-                    if code == "ENTRY_ORDER":
-                        entry_order = val
-                    elif code == "MUSIC":
-                        if pos:
-                            music[pos] = val
-                    elif code == "CLUB":
-                        if pos:
-                            clubs[pos] = val
-                    elif code == "ELEMENT_CODE_FREE":
-                        elements_free.append((pos, val))
-                    elif code == "ELEMENT_CODE_SHORT":
-                        elements_short.append((pos, val))
+                    for entry in reg.findall("EventEntry"):
+                        code = (entry.attrib.get("Code") or "").strip()
+                        pos = safe_int(entry.attrib.get("Pos"))
+                        val = (entry.attrib.get("Value") or "").strip()
 
-                elements_free = [v for _, v in sorted(elements_free) if v]
-                elements_short = [v for _, v in sorted(elements_short) if v]
+                        if code == "ENTRY_ORDER":
+                            entry_order = val
+                        elif code == "MUSIC":
+                            if pos:
+                                music[pos] = val
+                        elif code == "CLUB":
+                            if pos:
+                                clubs[pos] = val
+                        elif code == "ELEMENT_CODE_FREE":
+                            elements_free.append((pos, val))
+                        elif code == "ELEMENT_CODE_SHORT":
+                            elements_short.append((pos, val))
 
-                log(f"Leser deltager: {print_name} (Event: {event_code})")
-                rows.append(
-                    {
-                        "PrintName": print_name,
-                        "GivenName": given,
-                        "FamilyName": family,
-                        "Gender": gender,
-                        "Organisation": org,
-                        "ParticipantCode": participant_code,
-                        "Event": event_code,
-                        "EntryOrder": entry_order,
-                        "Music1": music.get(1, ""),
-                        "Music2": music.get(2, ""),
-                        "Club1": clubs.get(1, ""),
-                        "Club2": clubs.get(2, ""),
-                        "ElementsFree": ", ".join(elements_free),
-                        "ElementsShort": ", ".join(elements_short),
-                    }
-                )
+                    elements_free = [v for _, v in sorted(elements_free) if v]
+                    elements_short = [v for _, v in sorted(elements_short) if v]
+
+                    log(f"Leser deltager: {print_name} (Event: {event_code})")
+                    rows.append(
+                        {
+                            "PrintName": print_name,
+                            "GivenName": given,
+                            "FamilyName": family,
+                            "Gender": gender,
+                            "Organisation": org,
+                            "ParticipantCode": participant_code,
+                            "Event": event_code,
+                            "EntryOrder": entry_order,
+                            "Music1": music.get(1, ""),
+                            "Music2": music.get(2, ""),
+                            "Club1": clubs.get(1, ""),
+                            "Club2": clubs.get(2, ""),
+                            "ElementsFree": ", ".join(elements_free),
+                            "ElementsShort": ", ".join(elements_short),
+                        }
+                    )
 
     return rows
 
@@ -152,6 +171,31 @@ def parse_duration_mmss(value):
     except ValueError:
         return None
     return None
+
+
+def parse_date_ddmmyy(value):
+    try:
+        return datetime.strptime(value.strip(), "%d.%m.%y").date()
+    except Exception:
+        return None
+
+
+def format_date_long(date_obj):
+    months = [
+        "januar",
+        "februar",
+        "mars",
+        "april",
+        "mai",
+        "juni",
+        "juli",
+        "august",
+        "september",
+        "oktober",
+        "november",
+        "desember",
+    ]
+    return f"{date_obj.day} {months[date_obj.month - 1]} {date_obj.year}"
 
 
 def is_registered(status):
@@ -458,40 +502,66 @@ def generate_pdf(rows, out_path, title, log):
     return True
 
 
-def build_startliste(rows, group_size, interval_seconds, start_time):
+def build_startliste(
+    rows, group_size, interval_seconds, start_time, pause_after=None, pause_seconds=None, pause_label="Vanningspause"
+):
     entries = []
     if not rows:
         return entries
     group_size = max(1, group_size)
     interval_seconds = max(1, interval_seconds)
+    pause_after = pause_after if pause_after and pause_after > 0 else None
+    pause_seconds = pause_seconds if pause_seconds and pause_seconds > 0 else None
 
     index = 0
     group_num = 1
+    current_dt = start_time
     while index < len(rows):
-        group_start_dt = start_time + timedelta(seconds=index * interval_seconds)
+        group_start_dt = current_dt
         group_label_time = group_start_dt.strftime("%H:%M:%S")
         if group_num > 1:
             group_label_time = f"ca. {group_label_time}"
-        entries.append(
-            {
-                "is_group": True,
-                "start": group_label_time,
-                "nr": "",
-                "navn": f"Oppvarmingsgruppe {group_num}",
-                "klubb": "",
-            }
-        )
+        group_entry = {
+            "is_group": True,
+            "start": group_label_time,
+            "end": "",
+            "nr": "",
+            "navn": f"Oppvarmingsgruppe {group_num}",
+            "klubb": "",
+        }
+        entries.append(group_entry)
+
         group_rows = rows[index : index + group_size]
         for offset, row in enumerate(group_rows, start=1):
+            runner_start = current_dt
+            runner_end = runner_start + timedelta(seconds=interval_seconds)
             entries.append(
                 {
                     "is_group": False,
-                    "start": "",
+                    "start": runner_start.strftime("%H:%M:%S"),
+                    "end": runner_end.strftime("%H:%M:%S"),
                     "nr": index + offset,
                     "navn": f"{row.get('GivenName', '')} {row.get('FamilyName', '')}".strip(),
                     "klubb": row.get("Organisation", ""),
                 }
             )
+            current_dt = runner_end
+            if pause_after and pause_seconds and (index + offset) == pause_after:
+                pause_start = current_dt
+                pause_end = pause_start + timedelta(seconds=pause_seconds)
+                entries.append(
+                    {
+                        "is_group": True,
+                        "start": pause_start.strftime("%H:%M:%S"),
+                        "end": pause_end.strftime("%H:%M:%S"),
+                        "nr": "",
+                        "navn": pause_label,
+                        "klubb": "",
+                    }
+                )
+                current_dt = pause_end
+
+        group_entry["end"] = current_dt.strftime("%H:%M:%S")
         index += group_size
         group_num += 1
     return entries
@@ -512,27 +582,36 @@ def generate_startliste_excel(entries, out_path, title, log):
 
     ws.append([title])
     ws.append([])
-    headers = ["Start (ca)", "Nr.", "Navn", "Klubb"]
+    headers = ["Nr.", "Start", "", "Slutt", "Navn", "Klubb"]
     ws.append(headers)
 
     header_font = Font(bold=True)
     for cell in ws[3]:
         cell.font = header_font
 
-    group_fill = PatternFill(start_color="EEEEEE", end_color="EEEEEE", fill_type="solid")
+    header_fill = PatternFill(start_color="ADADAD", end_color="ADADAD", fill_type="solid")
+    group_fill = PatternFill(start_color="D0D0D0", end_color="D0D0D0", fill_type="solid")
     group_font = Font(bold=True)
 
     for entry in entries:
-        ws.append([entry["start"], entry["nr"], entry["navn"], entry["klubb"]])
+        ws.append([entry["nr"], entry["start"], "-", entry["end"], entry["navn"], entry["klubb"]])
         if entry["is_group"]:
             for cell in ws[ws.max_row]:
                 cell.font = group_font
                 cell.fill = group_fill
+    for cell in ws[3]:
+        cell.fill = header_fill
 
-    ws.column_dimensions[get_column_letter(1)].width = 14
-    ws.column_dimensions[get_column_letter(2)].width = 6
-    ws.column_dimensions[get_column_letter(3)].width = 38
-    ws.column_dimensions[get_column_letter(4)].width = 16
+    ws.column_dimensions[get_column_letter(1)].width = 6
+    ws.column_dimensions[get_column_letter(2)].width = 10
+    ws.column_dimensions[get_column_letter(3)].width = 3
+    ws.column_dimensions[get_column_letter(4)].width = 10
+    ws.column_dimensions[get_column_letter(5)].width = 38
+    ws.column_dimensions[get_column_letter(6)].width = 16
+
+    generated_ts = datetime.now().strftime("Generert %d.%m.%Y %H:%M")
+    ws.append([])
+    ws.append([generated_ts])
 
     try:
         wb.save(out_path)
@@ -551,37 +630,77 @@ def generate_startliste_pdf(entries, out_path, title, log):
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
-        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
     except Exception:
         log("Mangler reportlab. Installer med: pip install reportlab")
         return False
 
-    data = [["Start (ca)", "Nr.", "Navn", "Klubb"]]
+    font_name = "Helvetica"
+    try:
+        calibri_path = Path("C:/Windows/Fonts/calibri.ttf")
+        if calibri_path.exists():
+            pdfmetrics.registerFont(TTFont("Calibri", str(calibri_path)))
+            font_name = "Calibri"
+    except Exception:
+        font_name = "Helvetica"
+
+    data = [["Nr.", "Start", "", "Slutt", "Navn", "Klubb"]]
+    body_style = ParagraphStyle(
+        "BodyCell",
+        fontName=font_name,
+        fontSize=10,
+        leading=11,
+    )
     for entry in entries:
-        data.append([entry["start"], entry["nr"], entry["navn"], entry["klubb"]])
+        name_cell = Paragraph(entry["navn"], body_style)
+        club_cell = Paragraph(entry["klubb"], body_style)
+        data.append([entry["nr"], entry["start"], "-", entry["end"], name_cell, club_cell])
 
-    doc = SimpleDocTemplate(out_path, pagesize=A4)
+    doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
-    story = [Paragraph(title, styles["Title"]), Spacer(1, 12)]
+    title_style = ParagraphStyle(
+        "StartTitle",
+        parent=styles["Title"],
+        fontName=font_name,
+        fontSize=16,
+        leading=18,
+    )
+    generated_ts = datetime.now().strftime("Generert %d.%m.%Y %H:%M")
+    story = [Paragraph(title, title_style), Spacer(1, 8)]
 
-    table = Table(data, repeatRows=1)
+    col_widths = [28, 64, 10, 64, 230, 127]
+    table = Table(data, repeatRows=1, colWidths=col_widths)
     style_cmds = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#ADADAD")),
+        ("FONTNAME", (0, 0), (-1, 0), font_name),
+        ("FONTNAME", (0, 1), (-1, -1), font_name),
+        ("FONTSIZE", (0, 0), (-1, 0), 11),
+        ("FONTSIZE", (0, 1), (-1, -1), 10),
+        ("ALIGN", (0, 0), (3, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 1),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("LINEABOVE", (0, 0), (-1, 0), 0.5, colors.black),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.black),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.black),
+        ("LINEBEFORE", (0, 0), (0, -1), 0.5, colors.black),
+        ("LINEAFTER", (-1, 0), (-1, -1), 0.5, colors.black),
     ]
     row_idx = 1
     for entry in entries:
         if entry["is_group"]:
             style_cmds.append(
-                ("BACKGROUND", (0, row_idx), (-1, row_idx), colors.HexColor("#EEEEEE"))
+                ("BACKGROUND", (0, row_idx), (-1, row_idx), colors.HexColor("#D0D0D0"))
             )
             style_cmds.append(("FONTNAME", (0, row_idx), (-1, row_idx), "Helvetica-Bold"))
         row_idx += 1
     table.setStyle(TableStyle(style_cmds))
     story.append(table)
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(generated_ts, ParagraphStyle("Gen", fontName=font_name, fontSize=9)))
 
     try:
         doc.build(story)
@@ -637,6 +756,33 @@ class App:
         ttk.Button(folder_frame, text="Velg mappe", command=self.choose_folder).pack(
             side="left"
         )
+        self.ind_excel = tk.Label(
+            folder_frame,
+            text="isonen/deltakerliste",
+            bg="#cccccc",
+            fg="#000000",
+            padx=6,
+            pady=2,
+        )
+        self.ind_music = tk.Label(
+            folder_frame,
+            text="musikkzip",
+            bg="#cccccc",
+            fg="#000000",
+            padx=6,
+            pady=2,
+        )
+        self.ind_data = tk.Label(
+            folder_frame,
+            text="FMS data",
+            bg="#cccccc",
+            fg="#000000",
+            padx=6,
+            pady=2,
+        )
+        self.ind_excel.pack(side="right", padx=4)
+        self.ind_music.pack(side="right", padx=4)
+        self.ind_data.pack(side="right", padx=4)
 
         btn_frame = ttk.Frame(container)
         btn_frame.pack(fill="x", pady=4)
@@ -674,6 +820,9 @@ class App:
         self.interval_var = tk.StringVar(value="3:40")
         self.group_size_var = tk.StringVar(value="8")
         self.location_var = tk.StringVar(value="iskanten")
+        self.pause_after_var = tk.StringVar(value="")
+        self.pause_duration_var = tk.StringVar(value="")
+        self.pause_label_var = tk.StringVar(value="Vanningspause")
 
         ttk.Label(start_frame, text="Dato:").pack(side="left", padx=(6, 2))
         try:
@@ -704,6 +853,17 @@ class App:
         )
         ttk.Label(start_frame, text="Sted:").pack(side="left")
         ttk.Entry(start_frame, textvariable=self.location_var, width=14).pack(
+            side="left", padx=4
+        )
+        ttk.Label(start_frame, text="Pause etter nr:").pack(side="left", padx=(6, 2))
+        ttk.Entry(start_frame, textvariable=self.pause_after_var, width=4).pack(
+            side="left", padx=4
+        )
+        ttk.Label(start_frame, text="Pause varighet:").pack(side="left")
+        ttk.Entry(start_frame, textvariable=self.pause_duration_var, width=6).pack(
+            side="left", padx=4
+        )
+        ttk.Entry(start_frame, textvariable=self.pause_label_var, width=12).pack(
             side="left", padx=4
         )
         self.shuffle_var = tk.BooleanVar(value=False)
@@ -742,6 +902,9 @@ class App:
         self.log_widget.delete("1.0", "end")
         self.rows = []
         self.zip_path = None
+        self.ind_data.config(bg="#cccccc")
+        self.ind_music.config(bg="#cccccc")
+        self.ind_excel.config(bg="#cccccc")
 
         folder = Path(self.folder_var.get())
         if not folder.exists():
@@ -753,12 +916,33 @@ class App:
             messagebox.showerror("Feil", "Fant ingen zip-filer i mappen.")
             return
 
-        if len(zips) > 1:
-            self.log(f"Fant flere zip-filer. Bruker: {zips[0].name}")
-        self.zip_path = zips[0]
+        data_zips = [
+            z
+            for z in zips
+            if z.name.lower().startswith("fmsdata") or z.name.lower().startswith("fsmdata")
+        ]
+        music_zips = [z for z in zips if z.name.lower().startswith("musikk")]
+        excel_files = [p for p in folder.glob("Deltakerliste*.xlsx")]
 
-        excel_name = "Deltakerliste - KUNSTLØP_ Oppvisning Bergen.xlsx"
-        excel_path = self.zip_path.parent / excel_name
+        if not data_zips:
+            messagebox.showerror("Feil", "Fant ingen FMSData*.zip i mappen.")
+            return
+        if not music_zips:
+            messagebox.showerror("Feil", "Fant ingen Musikk*.zip i mappen.")
+            return
+        if not excel_files:
+            messagebox.showerror("Feil", "Fant ingen Deltakerliste*.xlsx i mappen.")
+            return
+
+        self.zip_path = data_zips[0]
+        if len(data_zips) > 1:
+            self.log(f"Fant flere FMSData-zip. Bruker: {self.zip_path.name}")
+        self.ind_data.config(bg="#3fbf5f")
+
+        excel_path = excel_files[0]
+        if len(excel_files) > 1:
+            self.log(f"Fant flere deltakerlister. Bruker: {excel_path.name}")
+        self.ind_excel.config(bg="#3fbf5f")
         self.rows = load_participants_from_excel(excel_path, self.log)
         if not self.rows:
             messagebox.showerror("Feil", "Fant ingen deltakere i excel-filen.")
@@ -782,11 +966,10 @@ class App:
                 else:
                     zip_rows.extend(parse_competition(xml_text, self.log))
 
-        music_zip = None
-        for z in zips:
-            if "musikk" in z.name.lower():
-                music_zip = z
-                break
+        music_zip = music_zips[0]
+        if len(music_zips) > 1:
+            self.log(f"Fant flere musikk-zip. Bruker: {music_zip.name}")
+        self.ind_music.config(bg="#3fbf5f")
 
         music_files = []
         music_durations = {}
@@ -918,10 +1101,14 @@ class App:
             messagebox.showerror("Feil", "Gruppe-storrelse må være > 0.")
             return
 
-        date_text = self.start_date_var.get().strip()
+        date_raw = self.start_date_var.get().strip()
+        date_obj = parse_date_ddmmyy(date_raw)
+        if not date_obj:
+            messagebox.showerror("Feil", "Ugyldig dato. Bruk DD.MM.ÅÅ.")
+            return
+        date_text = format_date_long(date_obj)
         location = self.location_var.get().strip() or "iskanten"
-        start_time_text = start_dt.strftime("%H.%M")
-        title = f"Startliste Oppvisning {date_text}, kl. {start_time_text}, {location}"
+        title = f"Oppvisningsstevne {location} {date_text}"
 
         filtered = [r for r in self.rows if is_registered(r.get("Påmelding", ""))]
         if not filtered:
@@ -930,7 +1117,30 @@ class App:
         if self.shuffle_var.get():
             random.shuffle(filtered)
 
-        entries = build_startliste(filtered, group_size, interval_seconds, start_dt)
+        pause_after = None
+        pause_seconds = None
+        if self.pause_after_var.get().strip():
+            try:
+                pause_after = int(self.pause_after_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Feil", "Ugyldig pause etter nr.")
+                return
+        if self.pause_duration_var.get().strip():
+            pause_seconds = parse_duration_mmss(self.pause_duration_var.get().strip())
+            if not pause_seconds:
+                messagebox.showerror("Feil", "Ugyldig pause-varighet.")
+                return
+        pause_label = self.pause_label_var.get().strip() or "Vanningspause"
+
+        entries = build_startliste(
+            filtered,
+            group_size,
+            interval_seconds,
+            start_dt,
+            pause_after=pause_after,
+            pause_seconds=pause_seconds,
+            pause_label=pause_label,
+        )
         out_dir = self.zip_path.parent / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
         base_name = self.zip_path.stem
@@ -1018,7 +1228,12 @@ class App:
 def main():
     root = tk.Tk()
     app = App(root)
-    root.geometry("900x600")
+    root.update_idletasks()
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    width = int(screen_w * 0.8)
+    height = min(700, int(screen_h * 0.8))
+    root.geometry(f"{width}x{height}")
     root.mainloop()
 
 
