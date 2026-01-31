@@ -122,14 +122,39 @@ def normalize_name(value):
 
 
 def normalize_text(value):
-    return " ".join((value or "").strip().lower().split())
+    text = (value or "").strip().lower()
+    text = (
+        text.replace("ø", "o")
+        .replace("å", "a")
+        .replace("æ", "ae")
+        .replace("ö", "o")
+        .replace("ä", "a")
+        .replace("é", "e")
+    )
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def tokenize_name(value):
+    norm = normalize_text(value)
+    return [t for t in norm.split() if t]
 
 
 def name_matches_filename(given, family, filename):
-    target1 = normalize_text(f"{given} {family}")
-    target2 = normalize_text(f"{family} {given}")
+    given_tokens = tokenize_name(given)
+    family_tokens = tokenize_name(family)
     hay = normalize_text(filename)
-    return (target1 and target1 in hay) or (target2 and target2 in hay)
+    if not given_tokens or not family_tokens:
+        return False
+    given_primary = given_tokens[0]
+    if given_primary not in hay:
+        return False
+    if all(token in hay for token in family_tokens):
+        return True
+    # fall back to first family token if full family doesn't match
+    if family_tokens[0] in hay:
+        return True
+    return False
 
 
 def format_duration(seconds):
@@ -321,7 +346,6 @@ def generate_excel(rows, out_path, log):
         "ParticipantCode",
         "Event",
         "Påmelding",
-        "Manglende i zip",
         "Musikk",
         "MusikkTid",
         "Club1",
@@ -362,7 +386,6 @@ def generate_html(rows, out_path, title, log):
         "ParticipantCode",
         "Event",
         "Påmelding",
-        "Manglende i zip",
         "Musikk",
         "MusikkTid",
         "Club1",
@@ -449,7 +472,6 @@ def generate_pdf(rows, out_path, title, log):
         "Organisation",
         "Event",
         "Påmelding",
-        "Manglende i zip",
         "Musikk",
         "MusikkTid",
         "ElementsFree",
@@ -503,7 +525,14 @@ def generate_pdf(rows, out_path, title, log):
 
 
 def build_startliste(
-    rows, group_size, interval_seconds, start_time, pause_after=None, pause_seconds=None, pause_label="Vanningspause"
+    rows,
+    group_size,
+    interval_seconds,
+    start_time,
+    warmup_seconds=0,
+    pause_after=None,
+    pause_seconds=None,
+    pause_label="Vanningspause",
 ):
     entries = []
     if not rows:
@@ -521,16 +550,18 @@ def build_startliste(
         group_label_time = group_start_dt.strftime("%H:%M:%S")
         if group_num > 1:
             group_label_time = f"ca. {group_label_time}"
+        warmup_end = group_start_dt + timedelta(seconds=warmup_seconds)
         group_entry = {
             "is_group": True,
             "start": group_label_time,
-            "end": "",
+            "end": warmup_end.strftime("%H:%M:%S"),
             "nr": "",
             "navn": f"Oppvarmingsgruppe {group_num}",
             "klubb": "",
         }
         entries.append(group_entry)
 
+        current_dt = warmup_end
         group_rows = rows[index : index + group_size]
         for offset, row in enumerate(group_rows, start=1):
             runner_start = current_dt
@@ -561,7 +592,6 @@ def build_startliste(
                 )
                 current_dt = pause_end
 
-        group_entry["end"] = current_dt.strftime("%H:%M:%S")
         index += group_size
         group_num += 1
     return entries
@@ -715,6 +745,45 @@ def generate_startliste_pdf(entries, out_path, title, log):
     return True
 
 
+def generate_vlc_playlist(rows, out_dir, base_name, music_zip, log):
+    if not music_zip:
+        log("Ingen musikk-zip funnet, kan ikke lage spilleliste.")
+        return False
+
+    playlist_path = Path(out_dir) / f"Startliste_{base_name}.m3u"
+    music_out = Path(out_dir) / "music"
+    music_out.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with zipfile.ZipFile(music_zip, "r") as mz:
+            lines = ["#EXTM3U"]
+            for row in rows:
+                fname = row.get("MusikkFil", "")
+                if not fname:
+                    continue
+                dest_path = music_out / fname
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                if not dest_path.exists():
+                    try:
+                        mz.extract(fname, music_out)
+                    except Exception:
+                        continue
+                duration = row.get("MusikkSek", "")
+                performer = row.get("PrintName", "")
+                song = Path(fname).stem
+                title = f"{performer} - {song}".strip(" -")
+                extinf = duration if duration != "" else -1
+                lines.append(f"#EXTINF:{extinf},{title}")
+                lines.append(str(dest_path.resolve()))
+    except Exception as exc:
+        log(f"Kunne ikke lage spilleliste: {exc}")
+        return False
+
+    playlist_path.write_text("\n".join(lines), encoding="utf-8")
+    log(f"Spilleliste skrevet: {playlist_path}")
+    return True
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -729,6 +798,7 @@ class App:
         style.configure("Subtitle.TLabel", font=("Segoe UI", 9))
         self.rows = []
         self.zip_path = None
+        self.music_zip = None
 
         base_dir = Path(__file__).resolve().parent
         self.folder_var = tk.StringVar(value=str(base_dir))
@@ -780,6 +850,8 @@ class App:
             padx=6,
             pady=2,
         )
+        self.count_label = ttk.Label(folder_frame, text="Utøvere: 0")
+        self.count_label.pack(side="right", padx=8)
         self.ind_excel.pack(side="right", padx=4)
         self.ind_music.pack(side="right", padx=4)
         self.ind_data.pack(side="right", padx=4)
@@ -791,26 +863,43 @@ class App:
             side="right"
         )
 
-        log_frame = ttk.Labelframe(container, text="Logg")
-        log_frame.pack(fill="both", expand=True, pady=6)
-        self.log_widget = ScrolledText(log_frame, height=12, wrap="word")
-        self.log_widget.pack(fill="both", expand=True, padx=6, pady=6)
-
-        out_frame = ttk.Labelframe(container, text="Rapporter")
-        out_frame.pack(fill="x", pady=6)
-        self.var_pdf = tk.BooleanVar(value=False)
-        self.var_excel = tk.BooleanVar(value=True)
-        self.var_html = tk.BooleanVar(value=True)
-        self.chk_pdf = ttk.Checkbutton(out_frame, text="PDF", variable=self.var_pdf)
-        self.chk_excel = ttk.Checkbutton(out_frame, text="Excel", variable=self.var_excel)
-        self.chk_html = ttk.Checkbutton(out_frame, text="HTML", variable=self.var_html)
-        self.chk_pdf.pack(side="left", padx=6, pady=6)
-        self.chk_excel.pack(side="left", padx=6, pady=6)
-        self.chk_html.pack(side="left", padx=6, pady=6)
-        self.btn_generate = ttk.Button(
-            out_frame, text="Lag filer", command=self.generate_files, state="disabled"
+        table_frame = ttk.Labelframe(container, text="Utøvere")
+        table_frame.pack(fill="both", expand=True, pady=6)
+        columns = (
+            "navn",
+            "klubb",
+            "påmelding",
+            "musikk",
+            "musikknavn",
+            "musikktid",
+            "event",
         )
-        self.btn_generate.pack(side="right", padx=6, pady=6)
+        self.tree = ttk.Treeview(
+            table_frame, columns=columns, show="headings", height=10
+        )
+        self.tree.heading("navn", text="Navn")
+        self.tree.heading("klubb", text="Klubb")
+        self.tree.heading("påmelding", text="Påmelding")
+        self.tree.heading("musikk", text="Musikk")
+        self.tree.heading("musikknavn", text="MP3-fil")
+        self.tree.heading("musikktid", text="MusikkTid")
+        self.tree.heading("event", text="Event")
+        self.tree.column("navn", width=220, anchor="w")
+        self.tree.column("klubb", width=140, anchor="w")
+        self.tree.column("påmelding", width=120, anchor="w")
+        self.tree.column("musikk", width=80, anchor="center")
+        self.tree.column("musikknavn", width=260, anchor="w")
+        self.tree.column("musikktid", width=80, anchor="center")
+        self.tree.column("event", width=160, anchor="w")
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=yscroll.set)
+        self.tree.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        yscroll.pack(side="right", fill="y", pady=6)
+
+        log_frame = ttk.Labelframe(container, text="Logg")
+        log_frame.pack(fill="x", pady=6)
+        self.log_widget = ScrolledText(log_frame, height=6, wrap="word")
+        self.log_widget.pack(fill="both", expand=True, padx=6, pady=6)
 
         start_frame = ttk.Labelframe(container, text="Startliste")
         start_frame.pack(fill="x", pady=6)
@@ -820,6 +909,7 @@ class App:
         self.interval_var = tk.StringVar(value="3:40")
         self.group_size_var = tk.StringVar(value="8")
         self.location_var = tk.StringVar(value="iskanten")
+        self.warmup_var = tk.StringVar(value="4:00")
         self.pause_after_var = tk.StringVar(value="")
         self.pause_duration_var = tk.StringVar(value="")
         self.pause_label_var = tk.StringVar(value="Vanningspause")
@@ -851,6 +941,10 @@ class App:
         ttk.Entry(start_frame, textvariable=self.group_size_var, width=4).pack(
             side="left", padx=4
         )
+        ttk.Label(start_frame, text="Oppvarming:").pack(side="left")
+        ttk.Entry(start_frame, textvariable=self.warmup_var, width=6).pack(
+            side="left", padx=4
+        )
         ttk.Label(start_frame, text="Sted:").pack(side="left")
         ttk.Entry(start_frame, textvariable=self.location_var, width=14).pack(
             side="left", padx=4
@@ -870,6 +964,12 @@ class App:
         ttk.Checkbutton(
             start_frame, text="Tilfeldig rekkefølge", variable=self.shuffle_var
         ).pack(side="left", padx=6)
+        self.playlist_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            start_frame,
+            text="Spilleliste for VLC musikkavspiller",
+            variable=self.playlist_var,
+        ).pack(side="left", padx=6)
         self.btn_startliste = ttk.Button(
             start_frame,
             text="Lag startliste (PDF+Excel)",
@@ -877,6 +977,22 @@ class App:
             state="disabled",
         )
         self.btn_startliste.pack(side="right", padx=6)
+
+        out_frame = ttk.Labelframe(container, text="Rapporter")
+        out_frame.pack(fill="x", pady=6)
+        self.var_pdf = tk.BooleanVar(value=False)
+        self.var_excel = tk.BooleanVar(value=True)
+        self.var_html = tk.BooleanVar(value=True)
+        self.chk_pdf = ttk.Checkbutton(out_frame, text="PDF", variable=self.var_pdf)
+        self.chk_excel = ttk.Checkbutton(out_frame, text="Excel", variable=self.var_excel)
+        self.chk_html = ttk.Checkbutton(out_frame, text="HTML", variable=self.var_html)
+        self.chk_pdf.pack(side="left", padx=6, pady=6)
+        self.chk_excel.pack(side="left", padx=6, pady=6)
+        self.chk_html.pack(side="left", padx=6, pady=6)
+        self.btn_generate = ttk.Button(
+            out_frame, text="Lag filer", command=self.generate_files, state="disabled"
+        )
+        self.btn_generate.pack(side="right", padx=6, pady=6)
 
         self.set_output_controls(enabled=False)
 
@@ -970,6 +1086,7 @@ class App:
         if len(music_zips) > 1:
             self.log(f"Fant flere musikk-zip. Bruker: {music_zip.name}")
         self.ind_music.config(bg="#3fbf5f")
+        self.music_zip = music_zip
 
         music_files = []
         music_durations = {}
@@ -1023,7 +1140,6 @@ class App:
                 row["Manglende i zip"] = ""
             else:
                 row["Manglende i zip"] = "JA"
-                self.log(f"Mangler i zip: {row.get('PrintName')}")
 
             if music_files:
                 matched = None
@@ -1036,18 +1152,24 @@ class App:
                         matched = fname
                         break
                 row["Musikk"] = "ok" if matched else "mangler"
-                row["MusikkTid"] = format_duration(
-                    music_durations.get(matched) if matched else None
-                )
-                if not matched:
-                    self.log(f"Mangler musikk: {row.get('PrintName')}")
+                row["MusikkFil"] = matched or ""
+                musikk_sec = music_durations.get(matched) if matched else None
+                row["MusikkTid"] = format_duration(musikk_sec)
+                row["MusikkSek"] = int(round(musikk_sec)) if musikk_sec else ""
             else:
                 row["Musikk"] = "mangler"
+                row["MusikkFil"] = ""
                 row["MusikkTid"] = ""
+                row["MusikkSek"] = ""
 
         for key, row in zip_map.items():
             if key not in excel_keys:
-                self.log(f"Finnes i zip, men ikke i excel: {row.get('PrintName')}")
+                pass
+
+        if music_files:
+            self.log("MP3-filer i musikk-zip:")
+            for fname in sorted(music_files):
+                self.log(f"- {fname}")
 
         if not self.rows:
             messagebox.showwarning("Info", "Fant ingen deltakere i xml.")
@@ -1055,7 +1177,27 @@ class App:
             return
 
         self.log(f"Totalt deltakere: {len(self.rows)}")
+        self.count_label.config(text=f"Utøvere: {len(self.rows)}")
         self.set_output_controls(enabled=True)
+        self.refresh_table()
+
+    def refresh_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for row in self.rows:
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    row.get("PrintName", ""),
+                    row.get("Organisation", ""),
+                    row.get("Påmelding", ""),
+                    row.get("Musikk", ""),
+                    row.get("MusikkFil", ""),
+                    row.get("MusikkTid", ""),
+                    row.get("Event", ""),
+                ),
+            )
 
     def generate_files(self):
         if not self.rows or not self.zip_path:
@@ -1090,6 +1232,10 @@ class App:
         interval_seconds = parse_duration_mmss(self.interval_var.get())
         if not interval_seconds:
             messagebox.showerror("Feil", "Ugyldig intervall. Bruk M:SS eller H:MM:SS.")
+            return
+        warmup_seconds = parse_duration_mmss(self.warmup_var.get())
+        if warmup_seconds is None:
+            messagebox.showerror("Feil", "Ugyldig oppvarming. Bruk M:SS.")
             return
 
         try:
@@ -1137,6 +1283,7 @@ class App:
             group_size,
             interval_seconds,
             start_dt,
+            warmup_seconds=warmup_seconds,
             pause_after=pause_after,
             pause_seconds=pause_seconds,
             pause_label=pause_label,
@@ -1150,6 +1297,8 @@ class App:
         generate_startliste_pdf(
             entries, str(out_dir / f"Startliste_{base_name}.pdf"), title, self.log
         )
+        if self.playlist_var.get():
+            generate_vlc_playlist(filtered, out_dir, base_name, self.music_zip, self.log)
         self.log("Startliste ferdig.")
 
     def show_about(self):
