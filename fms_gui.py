@@ -639,7 +639,9 @@ def generate_startliste_excel(entries, out_path, title, log):
     ws.column_dimensions[get_column_letter(5)].width = 38
     ws.column_dimensions[get_column_letter(6)].width = 16
 
-    generated_ts = datetime.now().strftime("Generert %d.%m.%Y %H:%M")
+    computer_name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or ""
+    suffix = f" • {computer_name}" if computer_name else ""
+    generated_ts = datetime.now().strftime("Generert %d.%m.%Y %H:%M") + suffix
     ws.append([])
     ws.append([generated_ts])
 
@@ -698,7 +700,9 @@ def generate_startliste_pdf(entries, out_path, title, log):
         fontSize=16,
         leading=18,
     )
-    generated_ts = datetime.now().strftime("Generert %d.%m.%Y %H:%M")
+    computer_name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or ""
+    suffix = f" • {computer_name}" if computer_name else ""
+    generated_ts = datetime.now().strftime("Generert %d.%m.%Y %H:%M") + suffix
     story = [Paragraph(title, title_style), Spacer(1, 8)]
 
     col_widths = [28, 64, 10, 64, 230, 127]
