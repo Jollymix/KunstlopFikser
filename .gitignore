@@ -12,3 +12,6 @@ __pycache__/
 # Output / temp
 output/
 _tmp_xml/
+
+# Generated output (never commit)
+output/
