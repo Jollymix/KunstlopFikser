@@ -1,0 +1,14 @@
+# Event / local files
+*.xlsx
+*.zip
+*.pdf
+*.jpg
+*.jpeg
+
+# Python
+__pycache__/
+*.pyc
+
+# Output / temp
+output/
+_tmp_xml/
