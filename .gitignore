@@ -4,6 +4,7 @@
 *.pdf
 *.jpg
 *.jpeg
+*.json
 
 # Python
 __pycache__/
