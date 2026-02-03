@@ -11,6 +11,7 @@ import subprocess
 from io import BytesIO
 import random
 import re
+import json
 
 
 def decode_xml_bytes(data):
@@ -138,6 +139,38 @@ def normalize_text(value):
 def tokenize_name(value):
     norm = normalize_text(value)
     return [t for t in norm.split() if t]
+
+
+def sanitize_filename(value):
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    return cleaned.strip("._") or "fil"
+
+
+def get_version():
+    version = "ukjent"
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parent,
+        )
+        if result.returncode == 0:
+            version = result.stdout.strip() or "ukjent"
+    except Exception:
+        version = "ukjent"
+    return version
+
+
+def format_generated_ts():
+    computer_name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or ""
+    suffix = f" â€¢ {computer_name}" if computer_name else ""
+    version = get_version()
+    return (
+        datetime.now().strftime("Generert %d.%m.%Y %H:%M")
+        + suffix
+        + f" â€¢ Revisjon: {version}"
+    )
 
 
 def name_matches_filename(given, family, filename):
@@ -512,6 +545,8 @@ def generate_pdf(rows, out_path, title, log):
             style_cmds.append(("TEXTCOLOR", (0, idx), (-1, idx), colors.HexColor("#7A0B0B")))
     table.setStyle(TableStyle(style_cmds))
     story.append(table)
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(format_generated_ts(), styles["Normal"]))
     try:
         doc.build(story)
     except PermissionError:
@@ -639,9 +674,7 @@ def generate_startliste_excel(entries, out_path, title, log):
     ws.column_dimensions[get_column_letter(5)].width = 38
     ws.column_dimensions[get_column_letter(6)].width = 16
 
-    computer_name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or ""
-    suffix = f" • {computer_name}" if computer_name else ""
-    generated_ts = datetime.now().strftime("Generert %d.%m.%Y %H:%M") + suffix
+    generated_ts = format_generated_ts()
     ws.append([])
     ws.append([generated_ts])
 
@@ -700,9 +733,7 @@ def generate_startliste_pdf(entries, out_path, title, log):
         fontSize=16,
         leading=18,
     )
-    computer_name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or ""
-    suffix = f" • {computer_name}" if computer_name else ""
-    generated_ts = datetime.now().strftime("Generert %d.%m.%Y %H:%M") + suffix
+    generated_ts = format_generated_ts()
     story = [Paragraph(title, title_style), Spacer(1, 8)]
 
     col_widths = [28, 64, 10, 64, 230, 127]
@@ -895,9 +926,32 @@ class App:
         self.tree.column("musikknavn", width=260, anchor="w")
         self.tree.column("musikktid", width=80, anchor="center")
         self.tree.column("event", width=160, anchor="w")
+        self.tree.configure(selectmode="browse")
+        controls_frame = ttk.Frame(table_frame)
+        self.btn_move_up = ttk.Button(
+            controls_frame, text="Flytt opp", command=self.move_selected_up, state="disabled"
+        )
+        self.btn_move_down = ttk.Button(
+            controls_frame, text="Flytt ned", command=self.move_selected_down, state="disabled"
+        )
+        self.btn_shuffle = ttk.Button(
+            controls_frame, text="Randomiser", command=self.shuffle_rows, state="disabled"
+        )
+        self.btn_save_order = ttk.Button(
+            controls_frame, text="Lagre rekkefølge", command=self.save_order, state="disabled"
+        )
+        self.btn_load_order = ttk.Button(
+            controls_frame, text="Last rekkefølge", command=self.load_order, state="disabled"
+        )
+        self.btn_move_up.pack(fill="x", padx=6, pady=(6, 2))
+        self.btn_move_down.pack(fill="x", padx=6, pady=2)
+        self.btn_shuffle.pack(fill="x", padx=6, pady=2)
+        self.btn_save_order.pack(fill="x", padx=6, pady=2)
+        self.btn_load_order.pack(fill="x", padx=6, pady=(2, 6))
         yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
         self.tree.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        controls_frame.pack(side="right", fill="y", pady=6)
         yscroll.pack(side="right", fill="y", pady=6)
 
         log_frame = ttk.Labelframe(container, text="Logg")
@@ -912,7 +966,7 @@ class App:
         self.start_time_var = tk.StringVar(value="18:00")
         self.interval_var = tk.StringVar(value="3:40")
         self.group_size_var = tk.StringVar(value="8")
-        self.location_var = tk.StringVar(value="iskanten")
+        self.location_var = tk.StringVar(value="Iskanten")
         self.warmup_var = tk.StringVar(value="4:00")
         self.pause_after_var = tk.StringVar(value="")
         self.pause_duration_var = tk.StringVar(value="")
@@ -964,10 +1018,6 @@ class App:
         ttk.Entry(start_frame, textvariable=self.pause_label_var, width=12).pack(
             side="left", padx=4
         )
-        self.shuffle_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            start_frame, text="Tilfeldig rekkefølge", variable=self.shuffle_var
-        ).pack(side="left", padx=6)
         self.playlist_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             start_frame,
@@ -999,6 +1049,7 @@ class App:
         self.btn_generate.pack(side="right", padx=6, pady=6)
 
         self.set_output_controls(enabled=False)
+        self.set_table_controls(enabled=False)
 
     def log(self, msg):
         self.log_widget.insert("end", msg + "\n")
@@ -1012,6 +1063,14 @@ class App:
         self.chk_html.config(state=state)
         self.btn_generate.config(state=state)
         self.btn_startliste.config(state=state)
+    
+    def set_table_controls(self, enabled):
+        state = "normal" if enabled else "disabled"
+        self.btn_move_up.config(state=state)
+        self.btn_move_down.config(state=state)
+        self.btn_shuffle.config(state=state)
+        self.btn_save_order.config(state=state)
+        self.btn_load_order.config(state=state)
 
     def choose_folder(self):
         path = filedialog.askdirectory(initialdir=self.folder_var.get())
@@ -1183,6 +1242,7 @@ class App:
         self.log(f"Totalt deltakere: {len(self.rows)}")
         self.count_label.config(text=f"Utøvere: {len(self.rows)}")
         self.set_output_controls(enabled=True)
+        self.set_table_controls(enabled=True)
         self.refresh_table()
 
     def refresh_table(self):
@@ -1202,6 +1262,110 @@ class App:
                     row.get("Event", ""),
                 ),
             )
+    
+    def row_key(self, row):
+        code = (row.get("ParticipantCode") or "").strip()
+        if code:
+            return f"code:{code}"
+        given = (row.get("GivenName") or "").strip()
+        family = (row.get("FamilyName") or "").strip()
+        event = (row.get("Event") or "").strip()
+        return f"name:{given}|{family}|{event}"
+
+    def move_selected(self, delta):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Info", "Velg en linje i tabellen først.")
+            return
+        if len(self.rows) < 2:
+            return
+        idx = self.tree.index(selected[0])
+        new_idx = idx + delta
+        if new_idx < 0 or new_idx >= len(self.rows):
+            return
+        self.rows[idx], self.rows[new_idx] = self.rows[new_idx], self.rows[idx]
+        self.refresh_table()
+        new_item = self.tree.get_children()[new_idx]
+        self.tree.selection_set(new_item)
+        self.tree.see(new_item)
+
+    def move_selected_up(self):
+        self.move_selected(-1)
+
+    def move_selected_down(self):
+        self.move_selected(1)
+
+    def shuffle_rows(self):
+        if not self.rows:
+            return
+        random.shuffle(self.rows)
+        self.refresh_table()
+
+    def save_order(self):
+        if not self.rows:
+            return
+        location = self.location_var.get().strip() or "sted"
+        date_raw = self.start_date_var.get().strip()
+        date_obj = parse_date_ddmmyy(date_raw)
+        date_part = date_obj.strftime("%Y-%m-%d") if date_obj else date_raw.replace(".", "-")
+        ts_display = datetime.now().strftime("%d.%m.%Y %H:%M")
+        ts_filename = ts_display.replace(":", ".")
+        base_name = f"{sanitize_filename(location)}_{sanitize_filename(date_part)}_{sanitize_filename(ts_filename)}_rekkefolge.json"
+        initial_dir = str((self.zip_path.parent / "output") if self.zip_path else Path.cwd())
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("Rekkefølge", "*.json"), ("Alle filer", "*.*")],
+            title="Lagre rekkefølge",
+            initialfile=base_name,
+            initialdir=initial_dir,
+        )
+        if not path:
+            return
+        data = {
+            "version": 1,
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "order": [self.row_key(r) for r in self.rows],
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.log(f"Lagret rekkefølge: {path}")
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke lagre rekkefølge: {exc}")
+
+    def load_order(self):
+        if not self.rows:
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[("Rekkefølge", "*.json"), ("Alle filer", "*.*")],
+            title="Last rekkefølge",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke lese rekkefølge: {exc}")
+            return
+        order = data.get("order") if isinstance(data, dict) else None
+        if not order or not isinstance(order, list):
+            messagebox.showerror("Feil", "Ugyldig rekkefølge-fil.")
+            return
+        buckets = {}
+        for row in self.rows:
+            key = self.row_key(row)
+            buckets.setdefault(key, []).append(row)
+        new_rows = []
+        for key in order:
+            bucket = buckets.get(key)
+            if bucket:
+                new_rows.append(bucket.pop(0))
+        for bucket in buckets.values():
+            new_rows.extend(bucket)
+        self.rows = new_rows
+        self.refresh_table()
+        self.log(f"Lastet rekkefølge: {path}")
 
     def generate_files(self):
         if not self.rows or not self.zip_path:
@@ -1264,9 +1428,6 @@ class App:
         if not filtered:
             messagebox.showwarning("Info", "Fant ingen påmeldte i listen.")
             return
-        if self.shuffle_var.get():
-            random.shuffle(filtered)
-
         pause_after = None
         pause_seconds = None
         if self.pause_after_var.get().strip():
@@ -1306,18 +1467,7 @@ class App:
         self.log("Startliste ferdig.")
 
     def show_about(self):
-        version = "ukjent"
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
-                capture_output=True,
-                text=True,
-                cwd=Path(__file__).resolve().parent,
-            )
-            if result.returncode == 0:
-                version = result.stdout.strip() or "ukjent"
-        except Exception:
-            version = "ukjent"
+        version = get_version()
 
         month_names = [
             "januar",
