@@ -41,7 +41,7 @@ def parse_competition(xml_text, log):
     except ET.ParseError as exc:
         if "junk after document element" in str(exc):
             log("XML inneholder flere dokumenter, prøver å hente alle OdfBody.")
-            for match in re.finditer(r"<OdfBody\\b", xml_text):
+            for match in re.finditer(r"<OdfBody\b", xml_text):
                 start = match.start()
                 end = xml_text.find("</OdfBody>", start)
                 if end != -1:
@@ -53,7 +53,8 @@ def parse_competition(xml_text, log):
         else:
             raise
 
-    for root in roots:
+    for idx_root, root in enumerate(roots, start=1):
+        log(f"Leser OdfBody {idx_root} av {len(roots)}.")
         comp = root.find("Competition")
         if comp is None:
             continue
@@ -140,6 +141,17 @@ def normalize_text(value):
 def tokenize_name(value):
     norm = normalize_text(value)
     return [t for t in norm.split() if t]
+
+def build_name_key(given, family, strict=True):
+    given_tokens = tokenize_name(given)
+    family_tokens = tokenize_name(family)
+    if not given_tokens and not family_tokens:
+        return ("", "")
+    if strict:
+        return (normalize_name(given), normalize_name(family))
+    given_primary = given_tokens[0] if given_tokens else ""
+    family_norm = " ".join(family_tokens)
+    return (given_primary, family_norm)
 
 
 def sanitize_filename(value):
@@ -823,12 +835,15 @@ class App:
         self.menubar = tk.Menu(self.root)
         self.root.config(menu=self.menubar)
         self.menu_startliste = tk.Menu(self.menubar, tearoff=0)
+        self.menu_rapporter = tk.Menu(self.menubar, tearoff=0)
         self.menu_rekkefolge = tk.Menu(self.menubar, tearoff=0)
         self.menu_hjelp = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Startliste", menu=self.menu_startliste)
+        self.menubar.add_cascade(label="Rapporter", menu=self.menu_rapporter)
         self.menubar.add_cascade(label="Rekkefølge", menu=self.menu_rekkefolge)
         self.menubar.add_cascade(label="Hjelp", menu=self.menu_hjelp)
         self.menu_startliste.add_command(label="Startliste...", command=self.open_startliste_window, state="disabled")
+        self.menu_rapporter.add_command(label="Lag filer", command=self.generate_files, state="disabled")
         self.menu_rekkefolge.add_command(label="Lagre rekkefølge", command=self.save_order, state="disabled")
         self.menu_rekkefolge.add_command(label="Last rekkefølge", command=self.load_order, state="disabled")
         self.menu_hjelp.add_command(label="Om", command=self.show_about)
@@ -1024,21 +1039,12 @@ class App:
         self.pause_label_var = tk.StringVar(value="Vanningspause")
         self.playlist_var = tk.BooleanVar(value=False)
 
-        out_frame = ttk.Labelframe(container, text="Rapporter")
-        out_frame.pack(fill="x", pady=6)
         self.var_pdf = tk.BooleanVar(value=False)
         self.var_excel = tk.BooleanVar(value=True)
         self.var_html = tk.BooleanVar(value=True)
-        self.chk_pdf = ttk.Checkbutton(out_frame, text="PDF", variable=self.var_pdf)
-        self.chk_excel = ttk.Checkbutton(out_frame, text="Excel", variable=self.var_excel)
-        self.chk_html = ttk.Checkbutton(out_frame, text="HTML", variable=self.var_html)
-        self.chk_pdf.pack(side="left", padx=6, pady=6)
-        self.chk_excel.pack(side="left", padx=6, pady=6)
-        self.chk_html.pack(side="left", padx=6, pady=6)
-        self.btn_generate = ttk.Button(
-            out_frame, text="Lag filer", command=self.generate_files, state="disabled"
-        )
-        self.btn_generate.pack(side="right", padx=6, pady=6)
+        self.menu_rapporter.add_checkbutton(label="PDF", variable=self.var_pdf, state="disabled")
+        self.menu_rapporter.add_checkbutton(label="Excel", variable=self.var_excel, state="disabled")
+        self.menu_rapporter.add_checkbutton(label="HTML", variable=self.var_html, state="disabled")
 
         self.set_output_controls(enabled=False)
         self.set_table_controls(enabled=False)
@@ -1052,10 +1058,10 @@ class App:
 
     def set_output_controls(self, enabled):
         state = "normal" if enabled else "disabled"
-        self.chk_pdf.config(state=state)
-        self.chk_excel.config(state=state)
-        self.chk_html.config(state=state)
-        self.btn_generate.config(state=state)
+        self.menu_rapporter.entryconfig(0, state=state)
+        self.menu_rapporter.entryconfig(1, state=state)
+        self.menu_rapporter.entryconfig(2, state=state)
+        self.menu_rapporter.entryconfig(3, state=state)
         self.menu_startliste.entryconfig(0, state=state)
     
     def set_table_controls(self, enabled):
@@ -1261,24 +1267,39 @@ class App:
         else:
             self.log("Fant ingen musikk-zip (navn med 'MUSIKK').")
 
-        zip_map = {}
+        zip_people_strict = {}
+        zip_people_loose = {}
         for row in zip_rows:
-            key = (
-                normalize_name(row.get("GivenName")),
-                normalize_name(row.get("FamilyName")),
-            )
-            if key[0] or key[1]:
-                zip_map[key] = row
+            strict_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=True)
+            loose_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=False)
+            if strict_key[0] or strict_key[1]:
+                zip_people_strict.setdefault(strict_key, row)
+            if loose_key[0] or loose_key[1]:
+                zip_people_loose.setdefault(loose_key, []).append(strict_key)
 
         excel_keys = set()
         used_music_files = set()
+        used_zip_keys = set()
+        used_loose_keys = set()
         for row in self.rows:
-            key = (
-                normalize_name(row.get("GivenName")),
-                normalize_name(row.get("FamilyName")),
-            )
-            excel_keys.add(key)
-            zip_row = zip_map.get(key)
+            strict_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=True)
+            loose_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=False)
+            excel_keys.add(strict_key)
+            zip_row = None
+            match_type = ""
+            if strict_key in zip_people_strict and strict_key not in used_zip_keys:
+                zip_row = zip_people_strict.get(strict_key)
+                used_zip_keys.add(strict_key)
+                match_type = "eksakt"
+            else:
+                for candidate_key in zip_people_loose.get(loose_key, []):
+                    if candidate_key in used_zip_keys:
+                        continue
+                    zip_row = zip_people_strict.get(candidate_key)
+                    if zip_row:
+                        used_zip_keys.add(candidate_key)
+                        match_type = "loose"
+                        break
             if zip_row:
                 row["ParticipantCode"] = zip_row.get("ParticipantCode", "")
                 row["Event"] = zip_row.get("Event", "")
@@ -1292,9 +1313,16 @@ class App:
                 zip_print = zip_row.get("PrintName") or f"{zip_row.get('GivenName', '')} {zip_row.get('FamilyName', '')}".strip()
                 row["NavnFraFsm"] = zip_print
                 row["Manglende i zip"] = ""
+                if loose_key[0] or loose_key[1]:
+                    used_loose_keys.add(loose_key)
+                if match_type == "loose":
+                    self.log(f"Matcher (loose): {row.get('NavnFraIsonen', '')} -> {zip_print}")
+                else:
+                    self.log(f"Matcher: {row.get('NavnFraIsonen', '')} -> {zip_print}")
             else:
                 row["Manglende i zip"] = "JA"
                 row["NavnFraFsm"] = ""
+                self.log(f"Mangler i FSM: {row.get('NavnFraIsonen', '')}")
 
             if music_files:
                 matched = self.match_music_file(row, music_files, used_music_files)
@@ -1313,38 +1341,43 @@ class App:
                 row["MusikkTid"] = ""
                 row["MusikkSek"] = ""
 
-        for key, row in zip_map.items():
-            if key not in excel_keys:
-                zip_given = (row.get("GivenName") or "").strip()
-                zip_family = (row.get("FamilyName") or "").strip()
-                zip_print = row.get("PrintName") or f"{zip_given} {zip_family}".strip()
-                self.rows.append(
-                    {
-                        "PrintName": zip_print,
-                        "NavnFraIsonen": "",
-                        "NavnFraFsm": zip_print,
-                        "GivenName": zip_given,
-                        "FamilyName": zip_family,
-                        "Gender": row.get("Gender", ""),
-                        "Organisation": row.get("Organisation", ""),
-                        "ParticipantCode": row.get("ParticipantCode", ""),
-                        "Event": row.get("Event", ""),
-                        "EntryOrder": row.get("EntryOrder", ""),
-                        "Påmelding": "",
-                        "Music1": row.get("Music1", ""),
-                        "Music2": row.get("Music2", ""),
-                        "Club1": row.get("Club1", ""),
-                        "Club2": row.get("Club2", ""),
-                        "ElementsFree": row.get("ElementsFree", ""),
-                        "ElementsShort": row.get("ElementsShort", ""),
-                        "Manglende i zip": "",
-                        "Musikk": "mangler",
-                        "MusikkFil": "",
-                        "MusikkTid": "",
-                        "MusikkSek": "",
-                        "StartTid": "",
-                    }
-                )
+        for key, row in zip_people_strict.items():
+            if key in used_zip_keys:
+                continue
+            loose_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=False)
+            if loose_key in used_loose_keys:
+                continue
+            zip_given = (row.get("GivenName") or "").strip()
+            zip_family = (row.get("FamilyName") or "").strip()
+            zip_print = row.get("PrintName") or f"{zip_given} {zip_family}".strip()
+            self.log(f"Ekstra i FSM (ny rad): {zip_print}")
+            self.rows.append(
+                {
+                    "PrintName": zip_print,
+                    "NavnFraIsonen": "",
+                    "NavnFraFsm": zip_print,
+                    "GivenName": zip_given,
+                    "FamilyName": zip_family,
+                    "Gender": row.get("Gender", ""),
+                    "Organisation": row.get("Organisation", ""),
+                    "ParticipantCode": row.get("ParticipantCode", ""),
+                    "Event": row.get("Event", ""),
+                    "EntryOrder": row.get("EntryOrder", ""),
+                    "Påmelding": "",
+                    "Music1": row.get("Music1", ""),
+                    "Music2": row.get("Music2", ""),
+                    "Club1": row.get("Club1", ""),
+                    "Club2": row.get("Club2", ""),
+                    "ElementsFree": row.get("ElementsFree", ""),
+                    "ElementsShort": row.get("ElementsShort", ""),
+                    "Manglende i zip": "",
+                    "Musikk": "mangler",
+                    "MusikkFil": "",
+                    "MusikkTid": "",
+                    "MusikkSek": "",
+                    "StartTid": "",
+                }
+            )
 
         if music_files:
             self.log("MP3-filer i musikk-zip:")
