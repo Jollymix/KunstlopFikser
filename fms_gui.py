@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from datetime import datetime, timedelta
 import subprocess
+import tempfile
 from io import BytesIO
 import random
 import re
@@ -174,20 +175,13 @@ def format_generated_ts():
 
 
 def name_matches_filename(given, family, filename):
-    given_tokens = tokenize_name(given)
     family_tokens = tokenize_name(family)
     hay = normalize_text(filename)
-    if not given_tokens or not family_tokens:
-        return False
-    given_primary = given_tokens[0]
-    if given_primary not in hay:
+    if not family_tokens:
         return False
     if all(token in hay for token in family_tokens):
         return True
-    # fall back to first family token if full family doesn't match
-    if family_tokens[0] in hay:
-        return True
-    return False
+    return family_tokens[0] in hay
 
 
 def format_duration(seconds):
@@ -324,6 +318,8 @@ def load_participants_from_excel(excel_path, log):
         out.append(
             {
                 "PrintName": print_name,
+                "NavnFraIsonen": f"{str(given).strip()} {str(family).strip()}".strip(),
+                "NavnFraFsm": "",
                 "GivenName": (str(given).strip() if given is not None else ""),
                 "FamilyName": (str(family).strip() if family is not None else ""),
                 "Gender": (str(gender).strip() if gender is not None else ""),
@@ -824,6 +820,18 @@ class App:
         self.root = root
         self.root.title("FSM Data Dekoder")
         self.root.minsize(900, 620)
+        self.menubar = tk.Menu(self.root)
+        self.root.config(menu=self.menubar)
+        self.menu_startliste = tk.Menu(self.menubar, tearoff=0)
+        self.menu_rekkefolge = tk.Menu(self.menubar, tearoff=0)
+        self.menu_hjelp = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Startliste", menu=self.menu_startliste)
+        self.menubar.add_cascade(label="Rekkefølge", menu=self.menu_rekkefolge)
+        self.menubar.add_cascade(label="Hjelp", menu=self.menu_hjelp)
+        self.menu_startliste.add_command(label="Startliste...", command=self.open_startliste_window, state="disabled")
+        self.menu_rekkefolge.add_command(label="Lagre rekkefølge", command=self.save_order, state="disabled")
+        self.menu_rekkefolge.add_command(label="Last rekkefølge", command=self.load_order, state="disabled")
+        self.menu_hjelp.add_command(label="Om", command=self.show_about)
         style = ttk.Style()
         try:
             style.theme_use("vista")
@@ -831,9 +839,19 @@ class App:
             style.theme_use("clam")
         style.configure("Title.TLabel", font=("Segoe UI", 14, "bold"))
         style.configure("Subtitle.TLabel", font=("Segoe UI", 9))
+        style.configure("Clock.TLabel", font=("Consolas", 56, "bold"))
         self.rows = []
         self.zip_path = None
         self.music_zip = None
+        self.music_cache_dir = None
+        self.audio_backend = None
+        self.audio_ready = False
+        self.current_track = ""
+        self.is_paused = False
+        self.current_duration = 0
+        self.play_pause_text = tk.StringVar(value="Spill")
+        self.external_playback = False
+        self.startliste_window = None
 
         base_dir = Path(__file__).resolve().parent
         self.folder_var = tk.StringVar(value=str(base_dir))
@@ -843,14 +861,14 @@ class App:
 
         header = ttk.Frame(container)
         header.pack(fill="x", pady=(0, 8))
-        ttk.Label(header, text="FSM Data Dekoder", style="Title.TLabel").pack(
-            side="left"
+        header_left = ttk.Frame(header)
+        header_left.pack(side="left")
+        # title removed
+        self.clock_var = tk.StringVar(value="00:00:00")
+        self.clock_label = ttk.Label(
+            header, textvariable=self.clock_var, style="Clock.TLabel", anchor="center"
         )
-        ttk.Label(
-            header,
-            text="Skann zip, sjekk musikkfiler og lag rapporter",
-            style="Subtitle.TLabel",
-        ).pack(side="left", padx=12)
+        self.clock_label.pack(side="left", fill="x", expand=True)
 
         folder_frame = ttk.Labelframe(container, text="Kilde")
         folder_frame.pack(fill="x", pady=6)
@@ -860,6 +878,9 @@ class App:
         )
         ttk.Button(folder_frame, text="Velg mappe", command=self.choose_folder).pack(
             side="left"
+        )
+        ttk.Button(folder_frame, text="Skann filer", command=self.read_zip).pack(
+            side="left", padx=(8, 0)
         )
         self.ind_excel = tk.Label(
             folder_frame,
@@ -893,40 +914,41 @@ class App:
 
         btn_frame = ttk.Frame(container)
         btn_frame.pack(fill="x", pady=4)
-        ttk.Button(btn_frame, text="Skann filer", command=self.read_zip).pack(side="left")
-        ttk.Button(btn_frame, text="?", width=3, command=self.show_about).pack(
-            side="right"
-        )
 
         table_frame = ttk.Labelframe(container, text="Utøvere")
         table_frame.pack(fill="both", expand=True, pady=6)
         columns = (
-            "navn",
+            "startnummer",
+            "starttid",
+            "navn_isonen",
+            "navn_fsm",
             "klubb",
             "påmelding",
-            "musikk",
             "musikknavn",
             "musikktid",
-            "event",
         )
         self.tree = ttk.Treeview(
             table_frame, columns=columns, show="headings", height=10
         )
-        self.tree.heading("navn", text="Navn")
+        self.tree.heading("startnummer", text="Startnummer")
+        self.tree.heading("starttid", text="Starttid")
+        self.tree.heading("navn_isonen", text="Navn fra isonen")
+        self.tree.heading("navn_fsm", text="Navn fra fsm")
         self.tree.heading("klubb", text="Klubb")
         self.tree.heading("påmelding", text="Påmelding")
-        self.tree.heading("musikk", text="Musikk")
         self.tree.heading("musikknavn", text="MP3-fil")
         self.tree.heading("musikktid", text="MusikkTid")
-        self.tree.heading("event", text="Event")
-        self.tree.column("navn", width=220, anchor="w")
+        self.tree.column("startnummer", width=90, anchor="center")
+        self.tree.column("starttid", width=90, anchor="center")
+        self.tree.column("navn_isonen", width=200, anchor="w")
+        self.tree.column("navn_fsm", width=200, anchor="w")
         self.tree.column("klubb", width=140, anchor="w")
         self.tree.column("påmelding", width=120, anchor="w")
-        self.tree.column("musikk", width=80, anchor="center")
         self.tree.column("musikknavn", width=260, anchor="w")
         self.tree.column("musikktid", width=80, anchor="center")
-        self.tree.column("event", width=160, anchor="w")
         self.tree.configure(selectmode="browse")
+        self.tree.tag_configure("missing_music", foreground="#b00020")
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
         controls_frame = ttk.Frame(table_frame)
         self.btn_move_up = ttk.Button(
             controls_frame, text="Flytt opp", command=self.move_selected_up, state="disabled"
@@ -937,30 +959,59 @@ class App:
         self.btn_shuffle = ttk.Button(
             controls_frame, text="Randomiser", command=self.shuffle_rows, state="disabled"
         )
-        self.btn_save_order = ttk.Button(
-            controls_frame, text="Lagre rekkefølge", command=self.save_order, state="disabled"
+        self.btn_sort_given = ttk.Button(
+            controls_frame, text="Sorter fornavn", command=self.sort_by_given, state="disabled"
         )
-        self.btn_load_order = ttk.Button(
-            controls_frame, text="Last rekkefølge", command=self.load_order, state="disabled"
+        self.btn_sort_family = ttk.Button(
+            controls_frame, text="Sorter etternavn", command=self.sort_by_family, state="disabled"
         )
         self.btn_move_up.pack(fill="x", padx=6, pady=(6, 2))
         self.btn_move_down.pack(fill="x", padx=6, pady=2)
         self.btn_shuffle.pack(fill="x", padx=6, pady=2)
-        self.btn_save_order.pack(fill="x", padx=6, pady=2)
-        self.btn_load_order.pack(fill="x", padx=6, pady=(2, 6))
+        self.btn_sort_given.pack(fill="x", padx=6, pady=2)
+        self.btn_sort_family.pack(fill="x", padx=6, pady=2)
+        # rekkefølge flyttet til meny
         yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
         self.tree.pack(side="left", fill="both", expand=True, padx=6, pady=6)
         controls_frame.pack(side="right", fill="y", pady=6)
         yscroll.pack(side="right", fill="y", pady=6)
 
+        player_frame = ttk.Labelframe(container, text="Avspiller")
+        player_frame.pack(fill="x", pady=6)
+        player_left = ttk.Frame(player_frame)
+        player_left.pack(side="left", padx=6, pady=6)
+        self.btn_player_play_pause = ttk.Button(
+            player_left,
+            textvariable=self.play_pause_text,
+            command=self.toggle_play_pause,
+            state="disabled",
+            width=10,
+        )
+        self.btn_player_stop = ttk.Button(
+            player_left,
+            text="Stopp",
+            command=self.stop_playback,
+            state="disabled",
+            width=8,
+        )
+        self.btn_player_play_pause.pack(side="left", padx=(0, 6))
+        self.btn_player_stop.pack(side="left")
+
+        player_mid = ttk.Frame(player_frame)
+        player_mid.pack(side="left", fill="x", expand=True, padx=6, pady=6)
+        self.player_track_var = tk.StringVar(value="Ingen spor valgt")
+        self.player_time_var = tk.StringVar(value="0:00 / 0:00")
+        ttk.Label(player_mid, textvariable=self.player_track_var).pack(anchor="w")
+        self.player_progress = ttk.Progressbar(player_mid, mode="determinate")
+        self.player_progress.pack(fill="x", pady=4)
+        ttk.Label(player_mid, textvariable=self.player_time_var).pack(anchor="w")
+
         log_frame = ttk.Labelframe(container, text="Logg")
         log_frame.pack(fill="x", pady=6)
         self.log_widget = ScrolledText(log_frame, height=6, wrap="word")
         self.log_widget.pack(fill="both", expand=True, padx=6, pady=6)
 
-        start_frame = ttk.Labelframe(container, text="Startliste")
-        start_frame.pack(fill="x", pady=6)
         today_str = datetime.now().strftime("%d.%m.%y")
         self.start_date_var = tk.StringVar(value=today_str)
         self.start_time_var = tk.StringVar(value="18:00")
@@ -971,66 +1022,7 @@ class App:
         self.pause_after_var = tk.StringVar(value="")
         self.pause_duration_var = tk.StringVar(value="")
         self.pause_label_var = tk.StringVar(value="Vanningspause")
-
-        ttk.Label(start_frame, text="Dato:").pack(side="left", padx=(6, 2))
-        try:
-            from tkcalendar import DateEntry
-
-            self.date_widget = DateEntry(
-                start_frame,
-                textvariable=self.start_date_var,
-                date_pattern="dd.mm.yy",
-                width=10,
-            )
-        except Exception:
-            self.date_widget = ttk.Entry(
-                start_frame, textvariable=self.start_date_var, width=10
-            )
-        self.date_widget.pack(side="left", padx=4)
-        ttk.Label(start_frame, text="Start kl:").pack(side="left")
-        ttk.Entry(start_frame, textvariable=self.start_time_var, width=8).pack(
-            side="left", padx=4
-        )
-        ttk.Label(start_frame, text="Intervall:").pack(side="left")
-        ttk.Entry(start_frame, textvariable=self.interval_var, width=6).pack(
-            side="left", padx=4
-        )
-        ttk.Label(start_frame, text="Gruppe str:").pack(side="left")
-        ttk.Entry(start_frame, textvariable=self.group_size_var, width=4).pack(
-            side="left", padx=4
-        )
-        ttk.Label(start_frame, text="Oppvarming:").pack(side="left")
-        ttk.Entry(start_frame, textvariable=self.warmup_var, width=6).pack(
-            side="left", padx=4
-        )
-        ttk.Label(start_frame, text="Sted:").pack(side="left")
-        ttk.Entry(start_frame, textvariable=self.location_var, width=14).pack(
-            side="left", padx=4
-        )
-        ttk.Label(start_frame, text="Pause etter nr:").pack(side="left", padx=(6, 2))
-        ttk.Entry(start_frame, textvariable=self.pause_after_var, width=4).pack(
-            side="left", padx=4
-        )
-        ttk.Label(start_frame, text="Pause varighet:").pack(side="left")
-        ttk.Entry(start_frame, textvariable=self.pause_duration_var, width=6).pack(
-            side="left", padx=4
-        )
-        ttk.Entry(start_frame, textvariable=self.pause_label_var, width=12).pack(
-            side="left", padx=4
-        )
         self.playlist_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            start_frame,
-            text="Spilleliste for VLC musikkavspiller",
-            variable=self.playlist_var,
-        ).pack(side="left", padx=6)
-        self.btn_startliste = ttk.Button(
-            start_frame,
-            text="Lag startliste (PDF+Excel)",
-            command=self.generate_startliste,
-            state="disabled",
-        )
-        self.btn_startliste.pack(side="right", padx=6)
 
         out_frame = ttk.Labelframe(container, text="Rapporter")
         out_frame.pack(fill="x", pady=6)
@@ -1050,6 +1042,8 @@ class App:
 
         self.set_output_controls(enabled=False)
         self.set_table_controls(enabled=False)
+        self.update_player_ui()
+        self.update_clock()
 
     def log(self, msg):
         self.log_widget.insert("end", msg + "\n")
@@ -1062,15 +1056,108 @@ class App:
         self.chk_excel.config(state=state)
         self.chk_html.config(state=state)
         self.btn_generate.config(state=state)
-        self.btn_startliste.config(state=state)
+        self.menu_startliste.entryconfig(0, state=state)
     
     def set_table_controls(self, enabled):
         state = "normal" if enabled else "disabled"
         self.btn_move_up.config(state=state)
         self.btn_move_down.config(state=state)
         self.btn_shuffle.config(state=state)
-        self.btn_save_order.config(state=state)
-        self.btn_load_order.config(state=state)
+        self.btn_sort_given.config(state=state)
+        self.btn_sort_family.config(state=state)
+        self.btn_player_play_pause.config(state=state)
+        self.btn_player_stop.config(state=state)
+        self.menu_rekkefolge.entryconfig(0, state=state)
+        self.menu_rekkefolge.entryconfig(1, state=state)
+
+    def open_startliste_window(self):
+        if self.startliste_window and self.startliste_window.winfo_exists():
+            self.startliste_window.deiconify()
+            self.startliste_window.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Startliste")
+        win.resizable(False, False)
+        self.startliste_window = win
+
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        row = 0
+        ttk.Label(frame, text="Dato:").grid(row=row, column=0, sticky="w", padx=(0, 4), pady=4)
+        try:
+            from tkcalendar import DateEntry
+
+            self.date_widget = DateEntry(
+                frame,
+                textvariable=self.start_date_var,
+                date_pattern="dd.mm.yy",
+                width=10,
+            )
+            self.date_widget.grid(row=row, column=1, sticky="w", pady=4)
+        except Exception:
+            self.date_widget = None
+            ttk.Entry(frame, textvariable=self.start_date_var, width=10).grid(
+                row=row, column=1, sticky="w", pady=4
+            )
+
+        ttk.Label(frame, text="Start kl:").grid(row=row, column=2, sticky="w", padx=(12, 4))
+        ttk.Entry(frame, textvariable=self.start_time_var, width=8).grid(
+            row=row, column=3, sticky="w"
+        )
+
+        ttk.Label(frame, text="Intervall:").grid(row=row, column=4, sticky="w", padx=(12, 4))
+        ttk.Entry(frame, textvariable=self.interval_var, width=6).grid(
+            row=row, column=5, sticky="w"
+        )
+
+        row += 1
+        ttk.Label(frame, text="Gruppe str:").grid(row=row, column=0, sticky="w", padx=(0, 4), pady=4)
+        ttk.Entry(frame, textvariable=self.group_size_var, width=4).grid(
+            row=row, column=1, sticky="w", pady=4
+        )
+
+        ttk.Label(frame, text="Oppvarming:").grid(row=row, column=2, sticky="w", padx=(12, 4))
+        ttk.Entry(frame, textvariable=self.warmup_var, width=6).grid(
+            row=row, column=3, sticky="w"
+        )
+
+        ttk.Label(frame, text="Sted:").grid(row=row, column=4, sticky="w", padx=(12, 4))
+        ttk.Entry(frame, textvariable=self.location_var, width=14).grid(
+            row=row, column=5, sticky="w"
+        )
+
+        row += 1
+        ttk.Label(frame, text="Pause etter nr:").grid(row=row, column=0, sticky="w", padx=(0, 4), pady=4)
+        ttk.Entry(frame, textvariable=self.pause_after_var, width=4).grid(
+            row=row, column=1, sticky="w", pady=4
+        )
+
+        ttk.Label(frame, text="Pause varighet:").grid(row=row, column=2, sticky="w", padx=(12, 4))
+        ttk.Entry(frame, textvariable=self.pause_duration_var, width=6).grid(
+            row=row, column=3, sticky="w"
+        )
+
+        ttk.Label(frame, text="Pause tekst:").grid(row=row, column=4, sticky="w", padx=(12, 4))
+        ttk.Entry(frame, textvariable=self.pause_label_var, width=12).grid(
+            row=row, column=5, sticky="w"
+        )
+
+        row += 1
+        ttk.Checkbutton(
+            frame,
+            text="Spilleliste for VLC musikkavspiller",
+            variable=self.playlist_var,
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 4))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=row, column=4, columnspan=2, sticky="e", pady=(6, 4))
+        ttk.Button(
+            btn_frame,
+            text="Lag startliste",
+            command=self.generate_startliste,
+        ).pack(side="right")
 
     def choose_folder(self):
         path = filedialog.askdirectory(initialdir=self.folder_var.get())
@@ -1084,6 +1171,7 @@ class App:
         self.ind_data.config(bg="#cccccc")
         self.ind_music.config(bg="#cccccc")
         self.ind_excel.config(bg="#cccccc")
+        self.music_cache_dir = None
 
         folder = Path(self.folder_var.get())
         if not folder.exists():
@@ -1183,6 +1271,7 @@ class App:
                 zip_map[key] = row
 
         excel_keys = set()
+        used_music_files = set()
         for row in self.rows:
             key = (
                 normalize_name(row.get("GivenName")),
@@ -1200,25 +1289,24 @@ class App:
                 row["Club2"] = zip_row.get("Club2", "")
                 row["ElementsFree"] = zip_row.get("ElementsFree", "")
                 row["ElementsShort"] = zip_row.get("ElementsShort", "")
+                zip_print = zip_row.get("PrintName") or f"{zip_row.get('GivenName', '')} {zip_row.get('FamilyName', '')}".strip()
+                row["NavnFraFsm"] = zip_print
                 row["Manglende i zip"] = ""
             else:
                 row["Manglende i zip"] = "JA"
+                row["NavnFraFsm"] = ""
 
             if music_files:
-                matched = None
-                for fname in music_files:
-                    if name_matches_filename(
-                        row.get("GivenName"),
-                        row.get("FamilyName"),
-                        fname,
-                    ):
-                        matched = fname
-                        break
+                matched = self.match_music_file(row, music_files, used_music_files)
                 row["Musikk"] = "ok" if matched else "mangler"
                 row["MusikkFil"] = matched or ""
                 musikk_sec = music_durations.get(matched) if matched else None
-                row["MusikkTid"] = format_duration(musikk_sec)
-                row["MusikkSek"] = int(round(musikk_sec)) if musikk_sec else ""
+                if matched and musikk_sec is None:
+                    row["MusikkTid"] = "Klarer ikke å hente tid"
+                    row["MusikkSek"] = ""
+                else:
+                    row["MusikkTid"] = format_duration(musikk_sec)
+                    row["MusikkSek"] = int(round(musikk_sec)) if musikk_sec else ""
             else:
                 row["Musikk"] = "mangler"
                 row["MusikkFil"] = ""
@@ -1227,7 +1315,36 @@ class App:
 
         for key, row in zip_map.items():
             if key not in excel_keys:
-                pass
+                zip_given = (row.get("GivenName") or "").strip()
+                zip_family = (row.get("FamilyName") or "").strip()
+                zip_print = row.get("PrintName") or f"{zip_given} {zip_family}".strip()
+                self.rows.append(
+                    {
+                        "PrintName": zip_print,
+                        "NavnFraIsonen": "",
+                        "NavnFraFsm": zip_print,
+                        "GivenName": zip_given,
+                        "FamilyName": zip_family,
+                        "Gender": row.get("Gender", ""),
+                        "Organisation": row.get("Organisation", ""),
+                        "ParticipantCode": row.get("ParticipantCode", ""),
+                        "Event": row.get("Event", ""),
+                        "EntryOrder": row.get("EntryOrder", ""),
+                        "Påmelding": "",
+                        "Music1": row.get("Music1", ""),
+                        "Music2": row.get("Music2", ""),
+                        "Club1": row.get("Club1", ""),
+                        "Club2": row.get("Club2", ""),
+                        "ElementsFree": row.get("ElementsFree", ""),
+                        "ElementsShort": row.get("ElementsShort", ""),
+                        "Manglende i zip": "",
+                        "Musikk": "mangler",
+                        "MusikkFil": "",
+                        "MusikkTid": "",
+                        "MusikkSek": "",
+                        "StartTid": "",
+                    }
+                )
 
         if music_files:
             self.log("MP3-filer i musikk-zip:")
@@ -1248,20 +1365,283 @@ class App:
     def refresh_table(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for row in self.rows:
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    row.get("PrintName", ""),
-                    row.get("Organisation", ""),
-                    row.get("Påmelding", ""),
-                    row.get("Musikk", ""),
-                    row.get("MusikkFil", ""),
-                    row.get("MusikkTid", ""),
-                    row.get("Event", ""),
-                ),
+        rows_values = []
+        for idx, row in enumerate(self.rows, start=1):
+            missing = not row.get("MusikkFil")
+            mp3_text = "mangler musikk" if missing else row.get("MusikkFil", "")
+            tags = ("missing_music",) if missing else ()
+            values = (
+                idx,
+                row.get("StartTid", ""),
+                row.get("NavnFraIsonen", ""),
+                row.get("NavnFraFsm", ""),
+                row.get("Organisation", ""),
+                row.get("Påmelding", ""),
+                mp3_text,
+                row.get("MusikkTid", ""),
             )
+            rows_values.append(values)
+            self.tree.insert("", "end", values=values, tags=tags)
+        self.autosize_columns(rows_values)
+
+    def autosize_columns(self, rows_values):
+        try:
+            import tkinter.font as tkfont
+        except Exception:
+            return
+        font = tkfont.nametofont("TkDefaultFont")
+        columns = list(self.tree["columns"])
+        if not columns:
+            return
+        padding = 16
+        max_widths = {}
+        for col in columns:
+            heading = self.tree.heading(col).get("text", "")
+            max_widths[col] = font.measure(str(heading)) + padding
+        for row in rows_values:
+            for col, value in zip(columns, row):
+                width = font.measure(str(value)) + padding
+                if width > max_widths.get(col, 0):
+                    max_widths[col] = width
+        for col in columns:
+            self.tree.column(col, width=max_widths.get(col, 80), stretch=False)
+
+    def update_clock(self):
+        self.clock_var.set(datetime.now().strftime("%H:%M:%S"))
+        self.root.after(500, self.update_clock)
+
+    def sort_by_given(self):
+        if not self.rows:
+            return
+        self.rows.sort(
+            key=lambda r: (
+                normalize_text(r.get("GivenName")),
+                normalize_text(r.get("FamilyName")),
+            )
+        )
+        self.refresh_table()
+
+    def sort_by_family(self):
+        if not self.rows:
+            return
+        self.rows.sort(
+            key=lambda r: (
+                normalize_text(r.get("FamilyName")),
+                normalize_text(r.get("GivenName")),
+            )
+        )
+        self.refresh_table()
+
+    def on_tree_double_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        column = self.tree.identify_column(event.x)
+        if not column:
+            return
+        col_index = int(column[1:]) - 1
+        columns = list(self.tree["columns"])
+        if col_index < 0 or col_index >= len(columns):
+            return
+        if columns[col_index] != "musikknavn":
+            return
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        values = self.tree.item(item_id, "values")
+        if col_index >= len(values):
+            return
+        filename = values[col_index]
+        self.play_mp3_file(filename)
+
+    def get_cached_mp3_path(self, filename):
+        if not filename:
+            messagebox.showinfo("Info", "Ingen MP3-fil registrert på denne raden.")
+            return None
+        if not self.music_zip:
+            messagebox.showerror("Feil", "Fant ingen musikk-zip.")
+            return None
+        try:
+            with zipfile.ZipFile(self.music_zip, "r") as mz:
+                try:
+                    data = mz.read(filename)
+                except KeyError:
+                    messagebox.showerror("Feil", f"Fant ikke MP3 i zip: {filename}")
+                    return None
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke lese musikk-zip: {exc}")
+            return None
+
+        if not self.music_cache_dir:
+            base = Path(tempfile.gettempdir()) / "fms_gui_music_cache"
+            base.mkdir(parents=True, exist_ok=True)
+            safe_zip = sanitize_filename(self.music_zip.stem)
+            self.music_cache_dir = base / safe_zip
+            self.music_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_name = sanitize_filename(filename)
+        out_path = self.music_cache_dir / safe_name
+        try:
+            out_path.write_bytes(data)
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke skrive MP3: {exc}")
+            return None
+        return out_path
+
+    def ensure_audio_backend(self):
+        if self.audio_ready:
+            return True
+        try:
+            import pygame
+        except Exception:
+            messagebox.showerror(
+                "Feil",
+                "For play/pause trengs pygame. Installer med: pip install pygame",
+            )
+            return False
+        try:
+            pygame.mixer.init()
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke starte lyd: {exc}")
+            return False
+        self.audio_backend = pygame
+        self.audio_ready = True
+        return True
+
+    def start_playback(self, path, filename):
+        if not self.ensure_audio_backend():
+            return False
+        row = self.find_row_by_mp3(filename)
+        self.current_duration = safe_int(row.get("MusikkSek")) if row else 0
+        try:
+            self.audio_backend.mixer.music.load(str(path))
+            self.audio_backend.mixer.music.play()
+        except Exception as exc:
+            self.log(f"Kunne ikke spille av med intern avspiller: {exc}")
+            try:
+                try:
+                    self.audio_backend.mixer.music.stop()
+                except Exception:
+                    pass
+                os.startfile(str(path))
+                self.external_playback = True
+                self.is_paused = False
+                self.play_pause_text.set("Spill")
+                if row:
+                    title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
+                    self.player_track_var.set(f"{title} - {filename}".strip(" -"))
+                else:
+                    self.player_track_var.set(filename)
+                self.player_time_var.set("Ekstern avspiller")
+                self.log(f"Spiller eksternt: {filename}")
+                return True
+            except Exception as exc2:
+                messagebox.showerror("Feil", f"Kunne ikke spille av: {exc2}")
+                return False
+        self.current_track = filename
+        self.is_paused = False
+        self.external_playback = False
+        self.play_pause_text.set("Pause")
+        if row:
+            title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
+            self.player_track_var.set(f"{title} - {filename}".strip(" -"))
+        else:
+            self.player_track_var.set(filename)
+        self.log(f"Spiller: {filename}")
+        return True
+
+    def play_mp3_file(self, filename):
+        path = self.get_cached_mp3_path(filename)
+        if not path:
+            return
+        if self.ensure_audio_backend():
+            self.start_playback(path, filename)
+            return
+        try:
+            os.startfile(str(path))
+            self.log(f"Spiller: {filename}")
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke starte avspilling: {exc}")
+
+    def get_selected_mp3_filename(self):
+        selected = self.tree.selection()
+        if not selected:
+            return ""
+        values = self.tree.item(selected[0], "values")
+        columns = list(self.tree["columns"])
+        try:
+            col_index = columns.index("musikknavn")
+        except ValueError:
+            return ""
+        if col_index >= len(values):
+            return ""
+        return values[col_index]
+
+    def toggle_play_pause(self):
+        if not self.ensure_audio_backend():
+            return
+        if self.external_playback:
+            messagebox.showinfo(
+                "Info",
+                "Spiller i ekstern avspiller. Pause/fortsett er ikke tilgjengelig.",
+            )
+            return
+        if self.audio_backend.mixer.music.get_busy():
+            if self.is_paused:
+                self.audio_backend.mixer.music.unpause()
+                self.is_paused = False
+                self.play_pause_text.set("Pause")
+                self.log("Fortsetter avspilling.")
+            else:
+                self.audio_backend.mixer.music.pause()
+                self.is_paused = True
+                self.play_pause_text.set("Spill")
+                self.log("Pause.")
+            return
+        filename = self.get_selected_mp3_filename()
+        if not filename:
+            messagebox.showinfo("Info", "Velg en rad med MP3-fil først.")
+            return
+        path = self.get_cached_mp3_path(filename)
+        if not path:
+            return
+        self.start_playback(path, filename)
+
+    def stop_playback(self):
+        if not self.ensure_audio_backend():
+            return
+        self.audio_backend.mixer.music.stop()
+        self.is_paused = False
+        self.external_playback = False
+        self.play_pause_text.set("Spill")
+        self.log("Stoppet avspilling.")
+
+    def find_row_by_mp3(self, filename):
+        for row in self.rows:
+            if row.get("MusikkFil") == filename:
+                return row
+        return None
+
+    def update_player_ui(self):
+        if self.external_playback:
+            self.player_progress.config(maximum=1, value=0)
+            self.root.after(500, self.update_player_ui)
+            return
+        elapsed = 0
+        if self.audio_ready:
+            pos_ms = self.audio_backend.mixer.music.get_pos()
+            if pos_ms and pos_ms > 0:
+                elapsed = pos_ms / 1000.0
+        duration = self.current_duration or 0
+        if duration > 0:
+            self.player_progress.config(maximum=duration, value=min(elapsed, duration))
+            elapsed_text = format_duration(elapsed)
+            total_text = format_duration(duration)
+            self.player_time_var.set(f"{elapsed_text} / {total_text}")
+        else:
+            self.player_progress.config(maximum=1, value=0)
+            self.player_time_var.set("0:00 / 0:00")
+        self.root.after(500, self.update_player_ui)
     
     def row_key(self, row):
         code = (row.get("ParticipantCode") or "").strip()
@@ -1367,6 +1747,42 @@ class App:
         self.refresh_table()
         self.log(f"Lastet rekkefølge: {path}")
 
+    def match_music_file(self, row, music_files, used_files):
+        given = row.get("GivenName")
+        family = row.get("FamilyName")
+        given_tokens = tokenize_name(given)
+        family_tokens = tokenize_name(family)
+        if not family_tokens:
+            return ""
+
+        def family_match(fname):
+            hay = normalize_text(fname)
+            return all(token in hay for token in family_tokens) or family_tokens[0] in hay
+
+        def given_match(fname):
+            if not given_tokens:
+                return False
+            hay = normalize_text(fname)
+            return given_tokens[0] in hay
+
+        # Pass 1: require both family + given (if given exists), prefer unused.
+        if given_tokens:
+            for fname in music_files:
+                if fname in used_files:
+                    continue
+                if family_match(fname) and given_match(fname):
+                    used_files.add(fname)
+                    return fname
+
+        # Pass 2: family-only fallback, prefer unused.
+        for fname in music_files:
+            if fname in used_files:
+                continue
+            if family_match(fname):
+                used_files.add(fname)
+                return fname
+        return ""
+
     def generate_files(self):
         if not self.rows or not self.zip_path:
             messagebox.showerror("Feil", "Ingen data lastet.")
@@ -1428,6 +1844,8 @@ class App:
         if not filtered:
             messagebox.showwarning("Info", "Fant ingen påmeldte i listen.")
             return
+        for row in self.rows:
+            row["StartTid"] = ""
         pause_after = None
         pause_seconds = None
         if self.pause_after_var.get().strip():
@@ -1453,6 +1871,15 @@ class App:
             pause_seconds=pause_seconds,
             pause_label=pause_label,
         )
+        filtered_index = 0
+        for entry in entries:
+            if entry.get("is_group"):
+                continue
+            if filtered_index >= len(filtered):
+                break
+            filtered[filtered_index]["StartTid"] = entry.get("start", "")
+            filtered_index += 1
+        self.refresh_table()
         out_dir = self.zip_path.parent / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
         base_name = self.zip_path.stem
