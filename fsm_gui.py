@@ -4,7 +4,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, simpledialog
 from tkinter.scrolledtext import ScrolledText
 from datetime import datetime, timedelta
 import subprocess
@@ -387,6 +387,8 @@ def generate_excel(rows, out_path, log):
         "ParticipantCode",
         "Event",
         "Påmelding",
+        "StartTid",
+        "SluttTid",
         "Musikk",
         "MusikkTid",
         "Club1",
@@ -427,6 +429,8 @@ def generate_html(rows, out_path, title, log):
         "ParticipantCode",
         "Event",
         "Påmelding",
+        "StartTid",
+        "SluttTid",
         "Musikk",
         "MusikkTid",
         "Club1",
@@ -513,6 +517,8 @@ def generate_pdf(rows, out_path, title, log):
         "Organisation",
         "Event",
         "Påmelding",
+        "StartTid",
+        "SluttTid",
         "Musikk",
         "MusikkTid",
         "ElementsFree",
@@ -835,14 +841,19 @@ class App:
         self.menubar = tk.Menu(self.root)
         self.root.config(menu=self.menubar)
         self.menu_startliste = tk.Menu(self.menubar, tearoff=0)
+        self.menu_musikk = tk.Menu(self.menubar, tearoff=0)
         self.menu_rapporter = tk.Menu(self.menubar, tearoff=0)
         self.menu_rekkefolge = tk.Menu(self.menubar, tearoff=0)
         self.menu_hjelp = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Startliste", menu=self.menu_startliste)
+        self.menubar.add_cascade(label="Musikk", menu=self.menu_musikk)
         self.menubar.add_cascade(label="Rapporter", menu=self.menu_rapporter)
         self.menubar.add_cascade(label="Rekkefølge", menu=self.menu_rekkefolge)
         self.menubar.add_cascade(label="Hjelp", menu=self.menu_hjelp)
         self.menu_startliste.add_command(label="Startliste...", command=self.open_startliste_window, state="disabled")
+        self.menu_musikk.add_command(
+            label="Lag spilleliste", command=self.generate_playlist_only, state="disabled"
+        )
         self.menu_rapporter.add_command(label="Lag filer", command=self.generate_files, state="disabled")
         self.menu_rekkefolge.add_command(label="Lagre rekkefølge", command=self.save_order, state="disabled")
         self.menu_rekkefolge.add_command(label="Last rekkefølge", command=self.load_order, state="disabled")
@@ -935,6 +946,7 @@ class App:
         columns = (
             "startnummer",
             "starttid",
+            "sluttid",
             "navn_isonen",
             "navn_fsm",
             "klubb",
@@ -947,6 +959,7 @@ class App:
         )
         self.tree.heading("startnummer", text="Startnummer")
         self.tree.heading("starttid", text="Starttid")
+        self.tree.heading("sluttid", text="Sluttid")
         self.tree.heading("navn_isonen", text="Navn fra isonen")
         self.tree.heading("navn_fsm", text="Navn fra fsm")
         self.tree.heading("klubb", text="Klubb")
@@ -955,6 +968,7 @@ class App:
         self.tree.heading("musikktid", text="MusikkTid")
         self.tree.column("startnummer", width=90, anchor="center")
         self.tree.column("starttid", width=90, anchor="center")
+        self.tree.column("sluttid", width=90, anchor="center")
         self.tree.column("navn_isonen", width=200, anchor="w")
         self.tree.column("navn_fsm", width=200, anchor="w")
         self.tree.column("klubb", width=140, anchor="w")
@@ -963,7 +977,9 @@ class App:
         self.tree.column("musikktid", width=80, anchor="center")
         self.tree.configure(selectmode="browse")
         self.tree.tag_configure("missing_music", foreground="#b00020")
+        self.tree.tag_configure("pause_row", background="#e0e0e0")
         self.tree.bind("<Double-1>", self.on_tree_double_click)
+        self.tree.bind("<Delete>", self.on_delete_key)
         controls_frame = ttk.Frame(table_frame)
         self.btn_move_up = ttk.Button(
             controls_frame, text="Flytt opp", command=self.move_selected_up, state="disabled"
@@ -980,11 +996,23 @@ class App:
         self.btn_sort_family = ttk.Button(
             controls_frame, text="Sorter etternavn", command=self.sort_by_family, state="disabled"
         )
+        self.btn_sort_start = ttk.Button(
+            controls_frame, text="Sorter starttid", command=self.sort_by_start_time, state="disabled"
+        )
+        self.btn_add_pause = ttk.Button(
+            controls_frame, text="Legg til pause", command=self.add_pause, state="disabled"
+        )
+        self.btn_delete_selected = ttk.Button(
+            controls_frame, text="Slett valgt", command=self.delete_selected, state="disabled"
+        )
         self.btn_move_up.pack(fill="x", padx=6, pady=(6, 2))
         self.btn_move_down.pack(fill="x", padx=6, pady=2)
         self.btn_shuffle.pack(fill="x", padx=6, pady=2)
         self.btn_sort_given.pack(fill="x", padx=6, pady=2)
         self.btn_sort_family.pack(fill="x", padx=6, pady=2)
+        self.btn_sort_start.pack(fill="x", padx=6, pady=2)
+        self.btn_add_pause.pack(fill="x", padx=6, pady=2)
+        self.btn_delete_selected.pack(fill="x", padx=6, pady=(2, 6))
         # rekkefølge flyttet til meny
         yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
@@ -1050,6 +1078,8 @@ class App:
         self.set_table_controls(enabled=False)
         self.update_player_ui()
         self.update_clock()
+        self.start_time_var.trace_add("write", self.on_time_settings_change)
+        self.interval_var.trace_add("write", self.on_time_settings_change)
 
     def log(self, msg):
         self.log_widget.insert("end", msg + "\n")
@@ -1063,6 +1093,11 @@ class App:
         self.menu_rapporter.entryconfig(2, state=state)
         self.menu_rapporter.entryconfig(3, state=state)
         self.menu_startliste.entryconfig(0, state=state)
+        self.menu_musikk.entryconfig(0, state=state)
+        if self.music_zip:
+            self.menu_musikk.entryconfig(0, state=state)
+        else:
+            self.menu_musikk.entryconfig(0, state="disabled")
     
     def set_table_controls(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -1071,6 +1106,9 @@ class App:
         self.btn_shuffle.config(state=state)
         self.btn_sort_given.config(state=state)
         self.btn_sort_family.config(state=state)
+        self.btn_sort_start.config(state=state)
+        self.btn_add_pause.config(state=state)
+        self.btn_delete_selected.config(state=state)
         self.btn_player_play_pause.config(state=state)
         self.btn_player_stop.config(state=state)
         self.menu_rekkefolge.entryconfig(0, state=state)
@@ -1159,6 +1197,11 @@ class App:
 
         btn_frame = ttk.Frame(frame)
         btn_frame.grid(row=row, column=4, columnspan=2, sticky="e", pady=(6, 4))
+        ttk.Button(
+            btn_frame,
+            text="Lag VLC spilleliste",
+            command=self.generate_playlist_only,
+        ).pack(side="right", padx=(0, 8))
         ttk.Button(
             btn_frame,
             text="Lag startliste",
@@ -1376,6 +1419,7 @@ class App:
                     "MusikkTid": "",
                     "MusikkSek": "",
                     "StartTid": "",
+                    "SluttTid": "",
                 }
             )
 
@@ -1399,13 +1443,20 @@ class App:
         for item in self.tree.get_children():
             self.tree.delete(item)
         rows_values = []
-        for idx, row in enumerate(self.rows, start=1):
-            missing = not row.get("MusikkFil")
+        display_idx = 1
+        for row in self.rows:
+            is_pause = bool(row.get("IsPause"))
+            missing = (not is_pause) and (not row.get("MusikkFil"))
             mp3_text = "mangler musikk" if missing else row.get("MusikkFil", "")
-            tags = ("missing_music",) if missing else ()
+            if is_pause:
+                tags = ("pause_row",)
+            else:
+                tags = ("missing_music",) if missing else ()
+            start_num = "" if is_pause else display_idx
             values = (
-                idx,
+                start_num,
                 row.get("StartTid", ""),
+                row.get("SluttTid", ""),
                 row.get("NavnFraIsonen", ""),
                 row.get("NavnFraFsm", ""),
                 row.get("Organisation", ""),
@@ -1415,6 +1466,8 @@ class App:
             )
             rows_values.append(values)
             self.tree.insert("", "end", values=values, tags=tags)
+            if not is_pause:
+                display_idx += 1
         self.autosize_columns(rows_values)
 
     def autosize_columns(self, rows_values):
@@ -1452,6 +1505,7 @@ class App:
                 normalize_text(r.get("FamilyName")),
             )
         )
+        self.recalc_times()
         self.refresh_table()
 
     def sort_by_family(self):
@@ -1463,6 +1517,18 @@ class App:
                 normalize_text(r.get("GivenName")),
             )
         )
+        self.recalc_times()
+        self.refresh_table()
+
+    def sort_by_start_time(self):
+        if not self.rows:
+            return
+        def sort_key(row):
+            raw = (row.get("StartTid") or "").strip()
+            parsed = parse_time_hhmm(raw)
+            return (parsed is None, parsed or datetime.max, raw)
+        self.rows.sort(key=sort_key)
+        self.recalc_times()
         self.refresh_table()
 
     def on_tree_double_click(self, event):
@@ -1697,10 +1763,128 @@ class App:
         if new_idx < 0 or new_idx >= len(self.rows):
             return
         self.rows[idx], self.rows[new_idx] = self.rows[new_idx], self.rows[idx]
+        self.recalc_times()
         self.refresh_table()
         new_item = self.tree.get_children()[new_idx]
         self.tree.selection_set(new_item)
         self.tree.see(new_item)
+
+    def delete_selected(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Info", "Velg en linje i tabellen først.")
+            return
+        if not self.rows:
+            return
+        idx = self.tree.index(selected[0])
+        if idx < 0 or idx >= len(self.rows):
+            return
+        row = self.rows[idx]
+        navn = row.get("NavnFraFsm") or row.get("NavnFraIsonen") or ""
+        if navn:
+            prompt = f"Slette valgt deltaker?\n\n{navn}"
+        else:
+            prompt = "Slette valgt deltaker?"
+        if not messagebox.askyesno("Bekreft sletting", prompt):
+            return
+        del self.rows[idx]
+        if navn:
+            self.log(f"Slettet deltaker: {navn}")
+        else:
+            self.log("Slettet deltaker.")
+        self.recalc_times()
+        self.refresh_table()
+        if self.rows:
+            new_idx = min(idx, len(self.rows) - 1)
+            new_item = self.tree.get_children()[new_idx]
+            self.tree.selection_set(new_item)
+            self.tree.see(new_item)
+
+    def add_pause(self):
+        if not self.rows:
+            messagebox.showinfo("Info", "Last inn deltakere før du legger til pause.")
+            return
+        pause_type = simpledialog.askstring("Legg til pause", "Type pause:", parent=self.root)
+        if not pause_type:
+            return
+        pause_type = pause_type.strip()
+        if not pause_type:
+            return
+        pause_duration = simpledialog.askstring(
+            "Legg til pause",
+            "Varighet (M:SS eller H:MM:SS):",
+            parent=self.root,
+        )
+        if not pause_duration:
+            return
+        pause_seconds = parse_duration_mmss(pause_duration.strip())
+        if not pause_seconds:
+            messagebox.showerror("Feil", "Ugyldig pause-varighet. Bruk M:SS eller H:MM:SS.")
+            return
+        row = {
+            "StartTid": "",
+            "SluttTid": "",
+            "NavnFraIsonen": pause_type,
+            "NavnFraFsm": pause_type,
+            "Organisation": "",
+            "Påmelding": "",
+            "MusikkFil": "",
+            "MusikkTid": "",
+            "PrintName": pause_type,
+            "GivenName": "",
+            "FamilyName": "",
+            "Gender": "",
+            "ParticipantCode": "",
+            "Event": "",
+            "EntryOrder": "",
+            "Music1": "",
+            "Music2": "",
+            "Club1": "",
+            "Club2": "",
+            "ElementsFree": [],
+            "ElementsShort": [],
+            "Musikk": "",
+            "MusikkSek": "",
+            "Manglende i zip": "",
+            "IsPause": True,
+            "PauseSek": pause_seconds,
+        }
+        self.rows.insert(0, row)
+        self.log(f"La til pause: {pause_type}")
+        self.recalc_times()
+        self.refresh_table()
+        if self.rows:
+            new_item = self.tree.get_children()[0]
+            self.tree.selection_set(new_item)
+            self.tree.see(new_item)
+
+    def on_delete_key(self, event):
+        self.delete_selected()
+
+    def recalc_times(self):
+        if not self.rows:
+            return
+        start_dt = parse_time_hhmm(self.start_time_var.get())
+        if not start_dt:
+            return
+        interval_seconds = parse_duration_mmss(self.interval_var.get())
+        if not interval_seconds:
+            return
+        current_dt = start_dt
+        for row in self.rows:
+            row["StartTid"] = current_dt.strftime("%H:%M:%S")
+            if row.get("IsPause"):
+                pause_seconds = row.get("PauseSek") or 0
+                current_dt = current_dt + timedelta(seconds=pause_seconds)
+            else:
+                current_dt = current_dt + timedelta(seconds=interval_seconds)
+            row["SluttTid"] = current_dt.strftime("%H:%M:%S")
+
+    def on_time_settings_change(self, *args):
+        if not self.rows:
+            return
+        self.recalc_times()
+        self.refresh_table()
 
     def move_selected_up(self):
         self.move_selected(-1)
@@ -1712,6 +1896,7 @@ class App:
         if not self.rows:
             return
         random.shuffle(self.rows)
+        self.recalc_times()
         self.refresh_table()
 
     def save_order(self):
@@ -1734,10 +1919,25 @@ class App:
         )
         if not path:
             return
+        order = []
+        for row in self.rows:
+            if row.get("IsPause"):
+                label = row.get("NavnFraIsonen") or row.get("NavnFraFsm") or "Pause"
+                order.append(
+                    {
+                        "type": "pause",
+                        "label": label,
+                        "seconds": row.get("PauseSek") or 0,
+                        "start": row.get("StartTid", ""),
+                        "end": row.get("SluttTid", ""),
+                    }
+                )
+            else:
+                order.append({"type": "row", "key": self.row_key(row)})
         data = {
-            "version": 1,
+            "version": 2,
             "created": datetime.now().isoformat(timespec="seconds"),
-            "order": [self.row_key(r) for r in self.rows],
+            "order": order,
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -1767,16 +1967,56 @@ class App:
             return
         buckets = {}
         for row in self.rows:
+            if row.get("IsPause"):
+                continue
             key = self.row_key(row)
             buckets.setdefault(key, []).append(row)
         new_rows = []
-        for key in order:
+        for item in order:
+            if isinstance(item, dict) and item.get("type") == "pause":
+                label = (item.get("label") or "Pause").strip()
+                pause_seconds = item.get("seconds") or 0
+                pause_row = {
+                    "StartTid": "",
+                    "SluttTid": "",
+                    "NavnFraIsonen": label,
+                    "NavnFraFsm": label,
+                    "Organisation": "",
+                    "Påmelding": "",
+                    "MusikkFil": "",
+                    "MusikkTid": "",
+                    "PrintName": label,
+                    "GivenName": "",
+                    "FamilyName": "",
+                    "Gender": "",
+                    "ParticipantCode": "",
+                    "Event": "",
+                    "EntryOrder": "",
+                    "Music1": "",
+                    "Music2": "",
+                    "Club1": "",
+                    "Club2": "",
+                    "ElementsFree": [],
+                    "ElementsShort": [],
+                    "Musikk": "",
+                    "MusikkSek": "",
+                    "Manglende i zip": "",
+                    "IsPause": True,
+                    "PauseSek": pause_seconds,
+                }
+                new_rows.append(pause_row)
+                continue
+            if isinstance(item, dict) and item.get("type") == "row":
+                key = item.get("key")
+            else:
+                key = item
             bucket = buckets.get(key)
             if bucket:
                 new_rows.append(bucket.pop(0))
         for bucket in buckets.values():
             new_rows.extend(bucket)
         self.rows = new_rows
+        self.recalc_times()
         self.refresh_table()
         self.log(f"Lastet rekkefølge: {path}")
 
@@ -1873,12 +2113,17 @@ class App:
         location = self.location_var.get().strip() or "iskanten"
         title = f"Oppvisningsstevne {location} {date_text}"
 
-        filtered = [r for r in self.rows if is_registered(r.get("Påmelding", ""))]
+        filtered = [
+            r
+            for r in self.rows
+            if (not r.get("IsPause")) and is_registered(r.get("Påmelding", ""))
+        ]
         if not filtered:
             messagebox.showwarning("Info", "Fant ingen påmeldte i listen.")
             return
         for row in self.rows:
             row["StartTid"] = ""
+            row["SluttTid"] = ""
         pause_after = None
         pause_seconds = None
         if self.pause_after_var.get().strip():
@@ -1911,6 +2156,7 @@ class App:
             if filtered_index >= len(filtered):
                 break
             filtered[filtered_index]["StartTid"] = entry.get("start", "")
+            filtered[filtered_index]["SluttTid"] = entry.get("end", "")
             filtered_index += 1
         self.refresh_table()
         out_dir = self.zip_path.parent / "output"
@@ -1925,6 +2171,50 @@ class App:
         if self.playlist_var.get():
             generate_vlc_playlist(filtered, out_dir, base_name, self.music_zip, self.log)
         self.log("Startliste ferdig.")
+
+    def generate_playlist_only(self):
+        if not self.rows or not self.zip_path:
+            messagebox.showerror("Feil", "Ingen data lastet.")
+            return
+        if not self.music_zip:
+            messagebox.showerror("Feil", "Fant ingen musikk-zip.")
+            return
+        filtered = [
+            r
+            for r in self.rows
+            if (not r.get("IsPause")) and is_registered(r.get("Påmelding", ""))
+        ]
+        if not filtered:
+            messagebox.showwarning("Info", "Fant ingen påmeldte i listen.")
+            return
+        out_dir = self.zip_path.parent / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        base_name = self.zip_path.stem
+        generate_vlc_playlist(filtered, out_dir, base_name, self.music_zip, self.log)
+        self.show_folder_link(out_dir, "Spilleliste ferdig")
+
+    def show_folder_link(self, folder_path, title):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Spilleliste lagret i:").pack(anchor="w")
+        path_text = str(folder_path)
+        link = ttk.Label(frame, text=path_text, foreground="#005a9e", cursor="hand2")
+        link.pack(anchor="w", pady=(4, 8))
+
+        def open_folder(event=None):
+            try:
+                os.startfile(path_text)
+            except Exception as exc:
+                messagebox.showerror("Feil", f"Kunne ikke åpne mappe: {exc}")
+
+        link.bind("<Button-1>", open_folder)
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Åpne mappe", command=open_folder).pack(side="right")
+        ttk.Button(btns, text="Lukk", command=win.destroy).pack(side="right", padx=(0, 6))
 
     def show_about(self):
         version = get_version()
