@@ -877,6 +877,7 @@ class App:
         self.current_duration = 0
         self.play_pause_text = tk.StringVar(value="Spill")
         self.external_playback = False
+        self.use_external_player_var = tk.BooleanVar(value=True)
         self.startliste_window = None
 
         base_dir = Path(__file__).resolve().parent
@@ -1040,6 +1041,12 @@ class App:
         )
         self.btn_player_play_pause.pack(side="left", padx=(0, 6))
         self.btn_player_stop.pack(side="left")
+        ttk.Checkbutton(
+            player_left,
+            text="Bruk ekstern spiller",
+            variable=self.use_external_player_var,
+            command=self.on_use_external_player_toggle,
+        ).pack(side="left", padx=(8, 0))
 
         player_mid = ttk.Frame(player_frame)
         player_mid.pack(side="left", fill="x", expand=True, padx=6, pady=6)
@@ -1188,20 +1195,8 @@ class App:
             row=row, column=5, sticky="w"
         )
 
-        row += 1
-        ttk.Checkbutton(
-            frame,
-            text="Spilleliste for VLC musikkavspiller",
-            variable=self.playlist_var,
-        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 4))
-
         btn_frame = ttk.Frame(frame)
         btn_frame.grid(row=row, column=4, columnspan=2, sticky="e", pady=(6, 4))
-        ttk.Button(
-            btn_frame,
-            text="Lag VLC spilleliste",
-            command=self.generate_playlist_only,
-        ).pack(side="right", padx=(0, 8))
         ttk.Button(
             btn_frame,
             text="Lag startliste",
@@ -1653,6 +1648,23 @@ class App:
         path = self.get_cached_mp3_path(filename)
         if not path:
             return
+        if self.use_external_player_var.get():
+            try:
+                os.startfile(str(path))
+                self.external_playback = True
+                self.is_paused = False
+                self.play_pause_text.set("Spill")
+                row = self.find_row_by_mp3(filename)
+                if row:
+                    title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
+                    self.player_track_var.set(f"{title} - {filename}".strip(" -"))
+                else:
+                    self.player_track_var.set(filename)
+                self.player_time_var.set("Ekstern avspiller")
+                self.log(f"Spiller eksternt: {filename}")
+            except Exception as exc:
+                messagebox.showerror("Feil", f"Kunne ikke starte avspilling: {exc}")
+            return
         if self.ensure_audio_backend():
             self.start_playback(path, filename)
             return
@@ -1677,6 +1689,12 @@ class App:
         return values[col_index]
 
     def toggle_play_pause(self):
+        if self.use_external_player_var.get():
+            messagebox.showinfo(
+                "Info",
+                "Bruker ekstern avspiller. Pause/fortsett er ikke tilgjengelig.",
+            )
+            return
         if not self.ensure_audio_backend():
             return
         if self.external_playback:
@@ -1707,6 +1725,9 @@ class App:
         self.start_playback(path, filename)
 
     def stop_playback(self):
+        if self.use_external_player_var.get():
+            messagebox.showinfo("Info", "Bruker ekstern avspiller. Stopp er ikke tilgjengelig.")
+            return
         if not self.ensure_audio_backend():
             return
         self.audio_backend.mixer.music.stop()
@@ -1741,6 +1762,19 @@ class App:
             self.player_progress.config(maximum=1, value=0)
             self.player_time_var.set("0:00 / 0:00")
         self.root.after(500, self.update_player_ui)
+
+    def on_use_external_player_toggle(self):
+        if self.use_external_player_var.get():
+            self.external_playback = True
+            self.player_time_var.set("Ekstern avspiller")
+            self.btn_player_play_pause.config(state="disabled")
+            self.btn_player_stop.config(state="disabled")
+        else:
+            self.external_playback = False
+            self.player_time_var.set("0:00 / 0:00")
+            if self.rows:
+                self.btn_player_play_pause.config(state="normal")
+                self.btn_player_stop.config(state="normal")
     
     def row_key(self, row):
         code = (row.get("ParticipantCode") or "").strip()
