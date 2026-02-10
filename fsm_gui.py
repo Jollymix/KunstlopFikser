@@ -172,6 +172,19 @@ def get_version():
             version = result.stdout.strip() or "ukjent"
     except Exception:
         version = "ukjent"
+    if version == "ukjent":
+        try:
+            version_file = Path(__file__).resolve().parent / "version.txt"
+            if version_file.exists():
+                version = version_file.read_text(encoding="utf-8").strip() or "ukjent"
+        except Exception:
+            pass
+    if version == "ukjent":
+        try:
+            mtime = Path(__file__).resolve().stat().st_mtime
+            version = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+        except Exception:
+            pass
     return version
 
 
