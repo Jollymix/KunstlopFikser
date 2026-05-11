@@ -190,12 +190,12 @@ def get_version():
 
 def format_generated_ts():
     computer_name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or ""
-    suffix = f" â€¢ {computer_name}" if computer_name else ""
+    suffix = f" • {computer_name}" if computer_name else ""
     version = get_version()
     return (
         datetime.now().strftime("Generert %d.%m.%Y %H:%M")
         + suffix
-        + f" â€¢ Revisjon: {version}"
+        + f" • Revisjon: {version}"
     )
 
 
@@ -890,7 +890,7 @@ class App:
         self.current_duration = 0
         self.play_pause_text = tk.StringVar(value="Spill")
         self.external_playback = False
-        self.use_external_player_var = tk.BooleanVar(value=True)
+        self.use_external_player_var = tk.BooleanVar(value=False)
         self.startliste_window = None
 
         base_dir = Path(__file__).resolve().parent
@@ -1607,7 +1607,7 @@ class App:
             )
             return False
         try:
-            pygame.mixer.init()
+            pygame.mixer.init(44100, -16, 2, 2048)
         except Exception as exc:
             messagebox.showerror("Feil", f"Kunne ikke starte lyd: {exc}")
             return False
@@ -1620,6 +1620,12 @@ class App:
             return False
         row = self.find_row_by_mp3(filename)
         self.current_duration = safe_int(row.get("MusikkSek")) if row else 0
+        try:
+            self.audio_backend.mixer.music.stop()
+            self.audio_backend.mixer.music.unload()
+        except Exception:
+            pass
+
         try:
             self.audio_backend.mixer.music.load(str(path))
             self.audio_backend.mixer.music.play()
