@@ -10,9 +10,12 @@ from datetime import datetime, timedelta
 import subprocess
 import tempfile
 from io import BytesIO
+import hashlib
 import random
 import re
 import json
+import shutil
+import wave
 
 
 def decode_xml_bytes(data):
@@ -157,6 +160,52 @@ def build_name_key(given, family, strict=True):
 def sanitize_filename(value):
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
     return cleaned.strip("._") or "fil"
+
+
+def detect_audio_format(data):
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "WAV", ".wav"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return "M4A", ".m4a"
+    if data[:3] == b"ID3":
+        return "MP3", ".mp3"
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        version_bits = (data[1] >> 3) & 0x03
+        layer_bits = (data[1] >> 1) & 0x03
+        if version_bits != 0x01 and layer_bits != 0x00:
+            return "MP3", ".mp3"
+    return "Ukjent", ""
+
+
+def get_audio_duration(data, audio_format):
+    try:
+        if audio_format == "WAV":
+            with wave.open(BytesIO(data), "rb") as audio:
+                frame_rate = audio.getframerate()
+                return audio.getnframes() / frame_rate if frame_rate else None
+        if audio_format == "MP3":
+            from mutagen.mp3 import MP3
+
+            return MP3(BytesIO(data)).info.length
+        if audio_format == "M4A":
+            from mutagen.mp4 import MP4
+
+            return MP4(BytesIO(data)).info.length
+    except Exception:
+        return None
+    return None
+
+
+def find_vlc_executable():
+    candidates = [shutil.which("vlc")]
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+        base_dir = os.environ.get(env_name)
+        if base_dir:
+            candidates.append(Path(base_dir) / "VideoLAN" / "VLC" / "vlc.exe")
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    return None
 
 
 def get_version():
@@ -857,12 +906,18 @@ class App:
         self.menu_musikk = tk.Menu(self.menubar, tearoff=0)
         self.menu_rapporter = tk.Menu(self.menubar, tearoff=0)
         self.menu_rekkefolge = tk.Menu(self.menubar, tearoff=0)
+        self.menu_innstillinger = tk.Menu(self.menubar, tearoff=0)
+        self.menu_tabellvisning = tk.Menu(self.menu_innstillinger, tearoff=0)
         self.menu_hjelp = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(label="Startliste", menu=self.menu_startliste)
         self.menubar.add_cascade(label="Musikk", menu=self.menu_musikk)
         self.menubar.add_cascade(label="Rapporter", menu=self.menu_rapporter)
         self.menubar.add_cascade(label="Rekkefølge", menu=self.menu_rekkefolge)
+        self.menubar.add_cascade(label="Innstillinger", menu=self.menu_innstillinger)
         self.menubar.add_cascade(label="Hjelp", menu=self.menu_hjelp)
+        self.menu_innstillinger.add_cascade(
+            label="Tabellvisning", menu=self.menu_tabellvisning
+        )
         self.menu_startliste.add_command(label="Startliste...", command=self.open_startliste_window, state="disabled")
         self.menu_musikk.add_command(
             label="Lag spilleliste", command=self.generate_playlist_only, state="disabled"
@@ -883,15 +938,18 @@ class App:
         self.zip_path = None
         self.music_zip = None
         self.music_cache_dir = None
+        self.music_file_info = {}
         self.audio_backend = None
         self.audio_ready = False
+        self.vlc_process = None
         self.current_track = ""
         self.is_paused = False
         self.current_duration = 0
         self.play_pause_text = tk.StringVar(value="Spill")
         self.external_playback = False
-        self.use_external_player_var = tk.BooleanVar(value=True)
+        self.use_external_player_var = tk.BooleanVar(value=False)
         self.startliste_window = None
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         base_dir = Path(__file__).resolve().parent
         self.folder_var = tk.StringVar(value=str(base_dir))
@@ -959,6 +1017,7 @@ class App:
         table_frame.pack(fill="both", expand=True, pady=6)
         columns = (
             "startnummer",
+            "lop_gjennomfort",
             "starttid",
             "sluttid",
             "navn_isonen",
@@ -966,21 +1025,25 @@ class App:
             "klubb",
             "påmelding",
             "musikknavn",
+            "musikkformat",
             "musikktid",
         )
         self.tree = ttk.Treeview(
             table_frame, columns=columns, show="headings", height=10
         )
         self.tree.heading("startnummer", text="Startnummer")
+        self.tree.heading("lop_gjennomfort", text="Løp gjennomført")
         self.tree.heading("starttid", text="Starttid")
         self.tree.heading("sluttid", text="Sluttid")
         self.tree.heading("navn_isonen", text="Navn fra isonen")
         self.tree.heading("navn_fsm", text="Navn fra fsm")
         self.tree.heading("klubb", text="Klubb")
         self.tree.heading("påmelding", text="Påmelding")
-        self.tree.heading("musikknavn", text="MP3-fil")
+        self.tree.heading("musikknavn", text="Lydfil")
+        self.tree.heading("musikkformat", text="Musikkformat")
         self.tree.heading("musikktid", text="MusikkTid")
         self.tree.column("startnummer", width=90, anchor="center")
+        self.tree.column("lop_gjennomfort", width=120, anchor="center")
         self.tree.column("starttid", width=90, anchor="center")
         self.tree.column("sluttid", width=90, anchor="center")
         self.tree.column("navn_isonen", width=200, anchor="w")
@@ -988,10 +1051,33 @@ class App:
         self.tree.column("klubb", width=140, anchor="w")
         self.tree.column("påmelding", width=120, anchor="w")
         self.tree.column("musikknavn", width=260, anchor="w")
+        self.tree.column("musikkformat", width=100, anchor="center")
         self.tree.column("musikktid", width=80, anchor="center")
         self.tree.configure(selectmode="browse")
+        self.table_columns = columns
+        self.table_column_vars = {}
+        for column in columns:
+            variable = tk.BooleanVar(value=True)
+            self.table_column_vars[column] = variable
+            self.menu_tabellvisning.add_checkbutton(
+                label=self.tree.heading(column).get("text", column),
+                variable=variable,
+                command=lambda changed=column: self.update_visible_table_columns(
+                    changed
+                ),
+            )
+        self.menu_tabellvisning.add_separator()
+        self.menu_tabellvisning.add_command(
+            label="Vis alle kolonner", command=self.show_all_table_columns
+        )
         self.tree.tag_configure("missing_music", foreground="#b00020")
+        self.tree.tag_configure("audio_warning", background="#fff3cd")
+        self.tree.tag_configure("audio_error", foreground="#b00020", background="#f8d7da")
         self.tree.tag_configure("pause_row", background="#e0e0e0")
+        self.tree.tag_configure(
+            "completed", foreground="#155724", background="#d4edda"
+        )
+        self.tree.bind("<Button-1>", self.on_tree_checkbox_click)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<Delete>", self.on_delete_key)
         controls_frame = ttk.Frame(table_frame)
@@ -1056,7 +1142,7 @@ class App:
         self.btn_player_stop.pack(side="left")
         ttk.Checkbutton(
             player_left,
-            text="Bruk ekstern spiller",
+            text="Bruk VLC direkte",
             variable=self.use_external_player_var,
             command=self.on_use_external_player_toggle,
         ).pack(side="left", padx=(8, 0))
@@ -1229,6 +1315,7 @@ class App:
         self.ind_music.config(bg="#cccccc")
         self.ind_excel.config(bg="#cccccc")
         self.music_cache_dir = None
+        self.music_file_info = {}
 
         folder = Path(self.folder_var.get())
         if not folder.exists():
@@ -1303,16 +1390,58 @@ class App:
             try:
                 with zipfile.ZipFile(music_zip, "r") as mz:
                     for entry in mz.infolist():
-                        if entry.filename.lower().endswith(".mp3"):
-                            music_files.append(entry.filename)
-                            try:
-                                from mutagen.mp3 import MP3
+                        declared_suffix = Path(entry.filename).suffix.lower()
+                        if entry.is_dir() or declared_suffix not in {
+                            ".mp3",
+                            ".wav",
+                            ".m4a",
+                            ".mp4",
+                            ".aac",
+                        }:
+                            continue
 
-                                data = mz.read(entry)
-                                audio = MP3(BytesIO(data))
-                                music_durations[entry.filename] = audio.info.length
-                            except Exception:
-                                music_durations[entry.filename] = None
+                        data = mz.read(entry)
+                        audio_format, detected_suffix = detect_audio_format(data)
+                        duration = get_audio_duration(data, audio_format)
+                        format_mismatch = bool(
+                            detected_suffix and declared_suffix != detected_suffix
+                        )
+                        music_files.append(entry.filename)
+                        music_durations[entry.filename] = duration
+                        self.music_file_info[entry.filename] = {
+                            "format": audio_format,
+                            "suffix": detected_suffix or declared_suffix,
+                            "declared_suffix": declared_suffix,
+                            "format_mismatch": format_mismatch,
+                            "playable": audio_format != "Ukjent",
+                        }
+
+                        if audio_format == "Ukjent":
+                            self.log(
+                                f"ADVARSEL: Ukjent lydformat: {entry.filename}"
+                            )
+                        elif format_mismatch:
+                            self.log(
+                                "ADVARSEL: "
+                                f"{entry.filename} har filendelsen "
+                                f"{declared_suffix}, men er egentlig {audio_format}."
+                            )
+                    format_warnings = sum(
+                        1
+                        for info in self.music_file_info.values()
+                        if info.get("format_mismatch")
+                    )
+                    format_errors = sum(
+                        1
+                        for info in self.music_file_info.values()
+                        if not info.get("playable")
+                    )
+                    self.log(
+                        "Lydkontroll: "
+                        f"{len(music_files)} filer, "
+                        f"{format_warnings} med feil filendelse, "
+                        f"{format_errors} med ukjent format."
+                    )
             except Exception as exc:
                 self.log(f"Kunne ikke lese musikk-zip: {music_zip} ({exc})")
         else:
@@ -1379,6 +1508,10 @@ class App:
                 matched = self.match_music_file(row, music_files, used_music_files)
                 row["Musikk"] = "ok" if matched else "mangler"
                 row["MusikkFil"] = matched or ""
+                audio_info = self.music_file_info.get(matched, {}) if matched else {}
+                row["MusikkFormat"] = audio_info.get("format", "")
+                row["MusikkFormatAvvik"] = audio_info.get("format_mismatch", False)
+                row["MusikkSpillbar"] = audio_info.get("playable", bool(matched))
                 musikk_sec = music_durations.get(matched) if matched else None
                 if matched and musikk_sec is None:
                     row["MusikkTid"] = "Klarer ikke å hente tid"
@@ -1389,6 +1522,9 @@ class App:
             else:
                 row["Musikk"] = "mangler"
                 row["MusikkFil"] = ""
+                row["MusikkFormat"] = ""
+                row["MusikkFormatAvvik"] = False
+                row["MusikkSpillbar"] = False
                 row["MusikkTid"] = ""
                 row["MusikkSek"] = ""
 
@@ -1432,7 +1568,7 @@ class App:
             )
 
         if music_files:
-            self.log("MP3-filer i musikk-zip:")
+            self.log("Lydfiler i musikk-zip:")
             for fname in sorted(music_files):
                 self.log(f"- {fname}")
 
@@ -1458,11 +1594,23 @@ class App:
             mp3_text = "mangler musikk" if missing else row.get("MusikkFil", "")
             if is_pause:
                 tags = ("pause_row",)
+            elif missing:
+                tags = ("missing_music",)
+            elif not row.get("MusikkSpillbar", True):
+                tags = ("audio_error",)
+            elif row.get("MusikkFormatAvvik"):
+                tags = ("audio_warning",)
             else:
-                tags = ("missing_music",) if missing else ()
+                tags = ()
+            if not is_pause and row.get("LopGjennomfort"):
+                tags = tags + ("completed",)
             start_num = "" if is_pause else display_idx
+            completed_checkbox = (
+                "" if is_pause else ("☑" if row.get("LopGjennomfort") else "☐")
+            )
             values = (
                 start_num,
+                completed_checkbox,
                 row.get("StartTid", ""),
                 row.get("SluttTid", ""),
                 row.get("NavnFraIsonen", ""),
@@ -1470,6 +1618,7 @@ class App:
                 row.get("Organisation", ""),
                 row.get("Påmelding", ""),
                 mp3_text,
+                row.get("MusikkFormat", ""),
                 row.get("MusikkTid", ""),
             )
             rows_values.append(values)
@@ -1499,6 +1648,27 @@ class App:
                     max_widths[col] = width
         for col in columns:
             self.tree.column(col, width=max_widths.get(col, 80), stretch=False)
+
+    def update_visible_table_columns(self, changed_column=None):
+        visible_columns = tuple(
+            column
+            for column in self.table_columns
+            if self.table_column_vars[column].get()
+        )
+        if not visible_columns:
+            if changed_column:
+                self.table_column_vars[changed_column].set(True)
+            messagebox.showinfo(
+                "Tabellvisning",
+                "Minst én kolonne må være synlig.",
+            )
+            return
+        self.tree.configure(displaycolumns=visible_columns)
+
+    def show_all_table_columns(self):
+        for variable in self.table_column_vars.values():
+            variable.set(True)
+        self.tree.configure(displaycolumns=self.table_columns)
 
     def update_clock(self):
         self.clock_var.set(datetime.now().strftime("%H:%M:%S"))
@@ -1539,31 +1709,87 @@ class App:
         self.recalc_times()
         self.refresh_table()
 
+    def get_tree_column_name(self, x_position):
+        display_column = self.tree.identify_column(x_position)
+        if not display_column:
+            return None
+        display_index = int(display_column[1:]) - 1
+        columns = list(self.tree["columns"])
+        display_columns = list(self.tree["displaycolumns"])
+        if display_columns == ["#all"]:
+            display_columns = columns
+        if display_index < 0 or display_index >= len(display_columns):
+            return None
+        return display_columns[display_index]
+
+    def on_tree_checkbox_click(self, event):
+        if self.tree.identify("region", event.x, event.y) != "cell":
+            return None
+        if self.get_tree_column_name(event.x) != "lop_gjennomfort":
+            return None
+
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return "break"
+        row_index = self.tree.index(item_id)
+        if row_index < 0 or row_index >= len(self.rows):
+            return "break"
+
+        row = self.rows[row_index]
+        if row.get("IsPause"):
+            return "break"
+
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        completed = bool(row.get("LopGjennomfort"))
+        name = (
+            row.get("NavnFraIsonen")
+            or row.get("PrintName")
+            or row.get("NavnFraFsm")
+            or "denne deltakeren"
+        )
+        if completed:
+            question = f"Vil du fjerne markeringen som gjennomført for {name}?"
+        else:
+            question = f"Vil du markere løpet som gjennomført for {name}?"
+        if not messagebox.askyesno(
+            "Bekreft løpsstatus",
+            question,
+            parent=self.root,
+        ):
+            return "break"
+
+        row["LopGjennomfort"] = not completed
+        status = "gjennomført" if not completed else "ikke gjennomført"
+        self.log(f"Løpsstatus for {name}: {status}.")
+        self.refresh_table()
+        items = self.tree.get_children()
+        if row_index < len(items):
+            self.tree.selection_set(items[row_index])
+            self.tree.focus(items[row_index])
+        return "break"
+
     def on_tree_double_click(self, event):
         region = self.tree.identify("region", event.x, event.y)
         if region != "cell":
             return
-        column = self.tree.identify_column(event.x)
-        if not column:
+        column_name = self.get_tree_column_name(event.x)
+        if column_name != "musikknavn":
             return
-        col_index = int(column[1:]) - 1
         columns = list(self.tree["columns"])
-        if col_index < 0 or col_index >= len(columns):
-            return
-        if columns[col_index] != "musikknavn":
-            return
         item_id = self.tree.identify_row(event.y)
         if not item_id:
             return
         values = self.tree.item(item_id, "values")
-        if col_index >= len(values):
+        value_index = columns.index(column_name)
+        if value_index >= len(values):
             return
-        filename = values[col_index]
+        filename = values[value_index]
         self.play_mp3_file(filename)
 
     def get_cached_mp3_path(self, filename):
         if not filename:
-            messagebox.showinfo("Info", "Ingen MP3-fil registrert på denne raden.")
+            messagebox.showinfo("Info", "Ingen lydfil registrert på denne raden.")
             return None
         if not self.music_zip:
             messagebox.showerror("Feil", "Fant ingen musikk-zip.")
@@ -1573,7 +1799,7 @@ class App:
                 try:
                     data = mz.read(filename)
                 except KeyError:
-                    messagebox.showerror("Feil", f"Fant ikke MP3 i zip: {filename}")
+                    messagebox.showerror("Feil", f"Fant ikke lydfil i zip: {filename}")
                     return None
         except Exception as exc:
             messagebox.showerror("Feil", f"Kunne ikke lese musikk-zip: {exc}")
@@ -1586,12 +1812,28 @@ class App:
             self.music_cache_dir = base / safe_zip
             self.music_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_name = sanitize_filename(filename)
+        audio_info = self.music_file_info.get(filename)
+        if not audio_info:
+            audio_format, detected_suffix = detect_audio_format(data)
+            audio_info = {
+                "format": audio_format,
+                "suffix": detected_suffix or Path(filename).suffix.lower(),
+            }
+            self.music_file_info[filename] = audio_info
+
+        safe_stem = sanitize_filename(Path(filename).stem)
+        content_hash = hashlib.sha256(data).hexdigest()[:12]
+        safe_name = f"{safe_stem}_{content_hash}{audio_info.get('suffix', '')}"
         out_path = self.music_cache_dir / safe_name
+        try:
+            if out_path.is_file() and out_path.stat().st_size == len(data):
+                return out_path
+        except OSError:
+            pass
         try:
             out_path.write_bytes(data)
         except Exception as exc:
-            messagebox.showerror("Feil", f"Kunne ikke skrive MP3: {exc}")
+            messagebox.showerror("Feil", f"Kunne ikke skrive lydfil: {exc}")
             return None
         return out_path
 
@@ -1600,51 +1842,86 @@ class App:
             return True
         try:
             import pygame
-        except Exception:
-            messagebox.showerror(
-                "Feil",
-                "For play/pause trengs pygame. Installer med: pip install pygame",
-            )
+        except Exception as exc:
+            self.log(f"Intern lydmotor (pygame) er ikke tilgjengelig: {exc}")
             return False
         try:
             pygame.mixer.init()
         except Exception as exc:
-            messagebox.showerror("Feil", f"Kunne ikke starte lyd: {exc}")
+            self.log(f"Kunne ikke starte intern lydmotor: {exc}")
             return False
         self.audio_backend = pygame
         self.audio_ready = True
         return True
 
+    def release_internal_audio(self):
+        if not self.audio_ready:
+            return
+        try:
+            self.audio_backend.mixer.music.stop()
+        except Exception:
+            pass
+        try:
+            self.audio_backend.mixer.music.unload()
+        except Exception:
+            pass
+
+    def set_external_playback_status(self, filename, player_name):
+        self.current_track = filename
+        self.external_playback = True
+        self.is_paused = False
+        self.play_pause_text.set("Spill")
+        row = self.find_row_by_mp3(filename)
+        if row:
+            title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
+            self.player_track_var.set(f"{title} - {filename}".strip(" -"))
+        else:
+            self.player_track_var.set(filename)
+        self.player_time_var.set(player_name)
+
+    def start_vlc_playback(self, path, filename, fallback_to_default=True):
+        vlc_path = find_vlc_executable()
+        if vlc_path:
+            try:
+                self.vlc_process = subprocess.Popen(
+                    [vlc_path, "--play-and-exit", "--no-video", str(path)]
+                )
+                self.set_external_playback_status(filename, "VLC")
+                self.log(f"Spiller med VLC: {filename}")
+                return True
+            except Exception as exc:
+                self.log(f"Kunne ikke starte VLC: {exc}")
+
+        if fallback_to_default:
+            try:
+                os.startfile(str(path))
+                self.set_external_playback_status(filename, "Ekstern avspiller")
+                self.log(f"Spiller med Windows-standardspiller: {filename}")
+                return True
+            except Exception as exc:
+                self.log(f"Kunne ikke starte ekstern avspiller: {exc}")
+
+        messagebox.showerror(
+            "Feil",
+            "Kunne ikke spille av lydfilen. VLC ble ikke funnet eller kunne ikke startes.",
+        )
+        return False
+
     def start_playback(self, path, filename):
         if not self.ensure_audio_backend():
-            return False
+            self.log("Intern lydmotor er ikke tilgjengelig. Prøver VLC.")
+            return self.start_vlc_playback(path, filename)
         row = self.find_row_by_mp3(filename)
         self.current_duration = safe_int(row.get("MusikkSek")) if row else 0
         try:
+            self.release_internal_audio()
             self.audio_backend.mixer.music.load(str(path))
             self.audio_backend.mixer.music.play()
         except Exception as exc:
             self.log(f"Kunne ikke spille av med intern avspiller: {exc}")
-            try:
-                try:
-                    self.audio_backend.mixer.music.stop()
-                except Exception:
-                    pass
-                os.startfile(str(path))
-                self.external_playback = True
-                self.is_paused = False
-                self.play_pause_text.set("Spill")
-                if row:
-                    title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
-                    self.player_track_var.set(f"{title} - {filename}".strip(" -"))
-                else:
-                    self.player_track_var.set(filename)
-                self.player_time_var.set("Ekstern avspiller")
-                self.log(f"Spiller eksternt: {filename}")
-                return True
-            except Exception as exc2:
-                messagebox.showerror("Feil", f"Kunne ikke spille av: {exc2}")
-                return False
+            self.release_internal_audio()
+            self.log("Prøver VLC som reserveavspiller.")
+            return self.start_vlc_playback(path, filename)
         self.current_track = filename
         self.is_paused = False
         self.external_playback = False
@@ -1662,30 +1939,9 @@ class App:
         if not path:
             return
         if self.use_external_player_var.get():
-            try:
-                os.startfile(str(path))
-                self.external_playback = True
-                self.is_paused = False
-                self.play_pause_text.set("Spill")
-                row = self.find_row_by_mp3(filename)
-                if row:
-                    title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
-                    self.player_track_var.set(f"{title} - {filename}".strip(" -"))
-                else:
-                    self.player_track_var.set(filename)
-                self.player_time_var.set("Ekstern avspiller")
-                self.log(f"Spiller eksternt: {filename}")
-            except Exception as exc:
-                messagebox.showerror("Feil", f"Kunne ikke starte avspilling: {exc}")
+            self.start_vlc_playback(path, filename)
             return
-        if self.ensure_audio_backend():
-            self.start_playback(path, filename)
-            return
-        try:
-            os.startfile(str(path))
-            self.log(f"Spiller: {filename}")
-        except Exception as exc:
-            messagebox.showerror("Feil", f"Kunne ikke starte avspilling: {exc}")
+        self.start_playback(path, filename)
 
     def get_selected_mp3_filename(self):
         selected = self.tree.selection()
@@ -1705,32 +1961,30 @@ class App:
         if self.use_external_player_var.get():
             messagebox.showinfo(
                 "Info",
-                "Bruker ekstern avspiller. Pause/fortsett er ikke tilgjengelig.",
+                "Bruker VLC direkte. Pause/fortsett styres i VLC.",
             )
-            return
-        if not self.ensure_audio_backend():
             return
         if self.external_playback:
             messagebox.showinfo(
                 "Info",
-                "Spiller i ekstern avspiller. Pause/fortsett er ikke tilgjengelig.",
+                "Spiller med reserveavspiller. Pause/fortsett styres der.",
             )
             return
-        if self.audio_backend.mixer.music.get_busy():
-            if self.is_paused:
-                self.audio_backend.mixer.music.unpause()
-                self.is_paused = False
-                self.play_pause_text.set("Pause")
-                self.log("Fortsetter avspilling.")
-            else:
-                self.audio_backend.mixer.music.pause()
-                self.is_paused = True
-                self.play_pause_text.set("Spill")
-                self.log("Pause.")
+        if self.audio_ready and self.is_paused:
+            self.audio_backend.mixer.music.unpause()
+            self.is_paused = False
+            self.play_pause_text.set("Pause")
+            self.log("Fortsetter avspilling.")
+            return
+        if self.audio_ready and self.audio_backend.mixer.music.get_busy():
+            self.audio_backend.mixer.music.pause()
+            self.is_paused = True
+            self.play_pause_text.set("Spill")
+            self.log("Pause.")
             return
         filename = self.get_selected_mp3_filename()
         if not filename:
-            messagebox.showinfo("Info", "Velg en rad med MP3-fil først.")
+            messagebox.showinfo("Info", "Velg en rad med lydfil først.")
             return
         path = self.get_cached_mp3_path(filename)
         if not path:
@@ -1739,11 +1993,29 @@ class App:
 
     def stop_playback(self):
         if self.use_external_player_var.get():
-            messagebox.showinfo("Info", "Bruker ekstern avspiller. Stopp er ikke tilgjengelig.")
+            if self.vlc_process and self.vlc_process.poll() is None:
+                self.vlc_process.terminate()
+                self.vlc_process = None
+                self.external_playback = False
+                self.play_pause_text.set("Spill")
+                self.log("Stoppet VLC-avspilling.")
+            else:
+                messagebox.showinfo("Info", "Stopp avspillingen i VLC.")
+            return
+        if self.external_playback:
+            if self.vlc_process and self.vlc_process.poll() is None:
+                self.vlc_process.terminate()
+                self.vlc_process = None
+                self.external_playback = False
+                self.play_pause_text.set("Spill")
+                self.log("Stoppet VLC-avspilling.")
+            else:
+                messagebox.showinfo("Info", "Stopp avspillingen i den eksterne spilleren.")
             return
         if not self.ensure_audio_backend():
             return
-        self.audio_backend.mixer.music.stop()
+        self.release_internal_audio()
+        self.current_track = ""
         self.is_paused = False
         self.external_playback = False
         self.play_pause_text.set("Spill")
@@ -1755,8 +2027,28 @@ class App:
                 return row
         return None
 
+    def on_close(self):
+        if self.vlc_process and self.vlc_process.poll() is None:
+            try:
+                self.vlc_process.terminate()
+            except Exception:
+                pass
+        if self.audio_ready:
+            self.release_internal_audio()
+            try:
+                self.audio_backend.mixer.quit()
+            except Exception:
+                pass
+        self.root.destroy()
+
     def update_player_ui(self):
         if self.external_playback:
+            if self.vlc_process and self.vlc_process.poll() is not None:
+                self.vlc_process = None
+                self.current_track = ""
+                self.external_playback = False
+                self.play_pause_text.set("Spill")
+                self.player_time_var.set("0:00 / 0:00")
             self.player_progress.config(maximum=1, value=0)
             self.root.after(500, self.update_player_ui)
             return
@@ -1765,6 +2057,14 @@ class App:
             pos_ms = self.audio_backend.mixer.music.get_pos()
             if pos_ms and pos_ms > 0:
                 elapsed = pos_ms / 1000.0
+            if (
+                self.current_track
+                and not self.is_paused
+                and not self.audio_backend.mixer.music.get_busy()
+            ):
+                self.release_internal_audio()
+                self.current_track = ""
+                self.play_pause_text.set("Spill")
         duration = self.current_duration or 0
         if duration > 0:
             self.player_progress.config(maximum=duration, value=min(elapsed, duration))
@@ -1778,13 +2078,12 @@ class App:
 
     def on_use_external_player_toggle(self):
         if self.use_external_player_var.get():
-            self.external_playback = True
-            self.player_time_var.set("Ekstern avspiller")
+            self.player_time_var.set("VLC direkte")
             self.btn_player_play_pause.config(state="disabled")
             self.btn_player_stop.config(state="disabled")
         else:
-            self.external_playback = False
-            self.player_time_var.set("0:00 / 0:00")
+            if not self.external_playback:
+                self.player_time_var.set("0:00 / 0:00")
             if self.rows:
                 self.btn_player_play_pause.config(state="normal")
                 self.btn_player_stop.config(state="normal")
