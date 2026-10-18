@@ -11,6 +11,7 @@ from datetime import datetime
 
 from kunstlopassistenten import (
     App,
+    auto_group_size,
     build_startliste,
     detect_audio_format,
     generate_startliste_excel,
@@ -125,7 +126,7 @@ class ScheduleTests(unittest.TestCase):
         return [new_participant(f"Løper{i}", "Test", "Loddefjord IL") for i in range(1, count + 1)]
 
     def test_groups_warmup_and_times(self):
-        items = layout_items(self.runners(3), 2, 0)
+        items = layout_items(self.runners(3), 2, 2, 0)
         entries = build_startliste(
             items, 190, datetime(2000, 1, 1, 8, 15), ready_seconds=30, warmup_seconds=240
         )
@@ -146,7 +147,7 @@ class ScheduleTests(unittest.TestCase):
         rows = self.runners(3)
         rows[0]["Påmelding"] = "Avmeldt"
 
-        items = layout_items(rows, 8, 0)
+        items = layout_items(rows, 1, 8, 0)
 
         self.assertIs(items[-1], rows[0])
         entries = build_startliste(items, 60, datetime(2000, 1, 1, 8, 0))
@@ -157,15 +158,40 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(water_pause_positions(4, 2), [1, 3])
         self.assertEqual(water_pause_positions(1, 1), [])
 
-        items = layout_items(self.runners(4), 2, 1)
+        items = layout_items(self.runners(4), 2, 2, 1)
         entries = build_startliste(items, 60, datetime(2000, 1, 1, 8, 0), water_seconds=900)
 
         self.assertEqual([e["kind"] for e in entries],
                          ["warmup", "run", "run", "pause", "warmup", "run", "run"])
         self.assertEqual((entries[3]["start"], entries[3]["end"]), ("08:02:00", "08:17:00"))
 
+    def test_no_warmup_groups(self):
+        items = layout_items(self.runners(4), 0, 8, 1)
+
+        self.assertEqual([i.get("Kind", "run") for i in items], ["run", "run", "pause", "run", "run"])
+
+    def test_group_count_splits_runners(self):
+        self.assertEqual(auto_group_size(7, 2), 4)
+        self.assertEqual(auto_group_size(9, 3), 3)
+
+        items = layout_items(self.runners(7), 3, 2, 0)
+        self.assertEqual([i.get("Kind", "run") for i in items],
+                         ["warmup", "run", "run", "warmup", "run", "run", "warmup", "run", "run", "run"])
+
+        items = layout_items(self.runners(3), 1, 1, 0)
+        self.assertEqual([i.get("Kind", "run") for i in items], ["warmup", "run", "run", "run"])
+
+    def test_custom_run_length(self):
+        rows = self.runners(2)
+        rows[0]["LopLengde"] = 150
+        entries = build_startliste(layout_items(rows, 0, 8, 0), 190, datetime(2000, 1, 1, 8, 0),
+                                   ready_seconds=30)
+
+        self.assertEqual([(e["run_length"], e["duration"], e["custom_length"]) for e in entries],
+                         [("00:02:30", "00:03:00", True), ("00:03:10", "00:03:40", False)])
+
     def test_detects_group_with_too_many_runners(self):
-        items = layout_items(self.runners(4), 2, 0)
+        items = layout_items(self.runners(4), 2, 2, 0)
         self.assertEqual(group_overflows(items, 2), {})
 
         runner = items.pop(4)  # første utøver i gruppe 2 flyttes inn i gruppe 1
@@ -176,7 +202,7 @@ class ScheduleTests(unittest.TestCase):
     def test_excel_has_original_sheet_and_sheet_with_duration(self):
         import openpyxl
 
-        items = layout_items(self.runners(3), 2, 0)
+        items = layout_items(self.runners(3), 2, 2, 0)
         entries = build_startliste(items, 190, datetime(2000, 1, 1, 8, 15), ready_seconds=30,
                                    warmup_seconds=240)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -186,17 +212,19 @@ class ScheduleTests(unittest.TestCase):
 
         self.assertEqual(wb.sheetnames, ["Startliste", "Med tidsforbruk"])
         plain, timed = wb["Startliste"], wb["Med tidsforbruk"]
-        self.assertEqual([c.value for c in plain[3]], ["Nr.", "Start", None, "Slutt", "Navn", "Klubb"])
-        self.assertEqual([c.value for c in plain[4]][1:5],
-                         ["08:15:00", "-", "08:19:00", "Oppvarmingsgruppe 1"])
+        self.assertEqual([c.value for c in plain[3]],
+                         ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Navn", "Klubb"])
+        self.assertEqual([c.value for c in plain[4]][1:4], ["08:15:00", "-", "08:19:00"])
+        self.assertEqual(plain["F4"].value, "Oppvarmingsgruppe 1")
         self.assertEqual(plain["B7"].value, "ca. 08:26:20")
         self.assertEqual([c.value for c in timed[3]],
-                         ["Nr.", "Start", None, "Slutt", "Tidsforbruk", "Navn", "Klubb"])
-        self.assertEqual([c.value for c in timed[5]], [1, "08:19:00", "-", "08:22:40", "00:03:40",
-                                                       "Løper1 Test", "Loddefjord IL"])
+                         ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Sammenlagt tidsforbruk",
+                          "Navn", "Klubb"])
+        self.assertEqual([c.value for c in timed[5]], [1, "08:19:00", "-", "08:22:40", "00:03:10",
+                                                       "00:03:40", "Løper1 Test", "Loddefjord IL"])
 
     def test_moved_water_pause_keeps_its_place_until_count_changes(self):
-        items = layout_items(self.runners(4), 2, 1)
+        items = layout_items(self.runners(4), 2, 2, 1)
         pause = items.pop(3)
         items.insert(1, pause)
 

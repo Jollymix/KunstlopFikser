@@ -697,22 +697,38 @@ def is_marker(item):
 
 
 def place_water_pauses(items, water_count):
-    # Fjerner gamle vanningspauser og legger nye jevnt fordelt foran oppvarmingsgruppene.
+    # Fjerner gamle vanningspauser og legger nye jevnt fordelt foran oppvarmingsgruppene,
+    # eller mellom utøverne når det ikke er noen oppvarmingsgrupper.
     items = [item for item in items if item.get("Kind") != "pause"]
-    warmups = [k for k, item in enumerate(items) if item.get("Kind") == "warmup"]
-    for position in reversed(water_pause_positions(len(warmups), water_count)):
-        items.insert(warmups[position], {"Kind": "pause"})
+    anchors = [k for k, item in enumerate(items) if item.get("Kind") == "warmup"]
+    if not anchors:
+        anchors = [k for k, item in enumerate(items)
+                   if not is_marker(item) and not is_cancelled(item.get("Påmelding", ""))]
+    for position in reversed(water_pause_positions(len(anchors), water_count)):
+        items.insert(anchors[position], {"Kind": "pause"})
     return items
 
 
-def layout_items(rows, group_size, water_count):
+def auto_group_size(runner_count, group_count):
+    # Antall utøvere delt likt på gruppene (halvparten, en tredjedel, ...), rundet opp.
+    if group_count < 1:
+        return 1
+    return max(1, -(-runner_count // group_count))
+
+
+def layout_items(rows, group_count, group_size, water_count):
     # Lager rekkefølgen oppvarmingsgruppe, utøvere, ... Avmeldte legges skjult bakerst.
-    group_size = max(1, group_size)
+    # Utøvere som ikke får plass havner i siste gruppe.
     active = [r for r in rows if not is_cancelled(r.get("Påmelding", ""))]
     items = []
-    for start in range(0, len(active), group_size):
-        items.append({"Kind": "warmup"})
-        items.extend(active[start : start + group_size])
+    if group_count < 1:
+        items.extend(active)
+    else:
+        group_size = max(1, group_size) if group_count > 1 else len(active)
+        for group in range(group_count):
+            items.append({"Kind": "warmup"})
+            last = group == group_count - 1
+            items.extend(active[group * group_size : None if last else (group + 1) * group_size])
     items.extend(r for r in rows if is_cancelled(r.get("Påmelding", "")))
     return place_water_pauses(items, water_count)
 
@@ -744,7 +760,7 @@ def build_startliste(
     group = 0
     nr = 0
 
-    def add(kind, seconds, nr, navn, klubb, row):
+    def add(kind, seconds, nr, navn, klubb, row, run_length=None):
         nonlocal current
         end = current + timedelta(seconds=seconds)
         entries.append(
@@ -754,6 +770,8 @@ def build_startliste(
                 "start": current.strftime("%H:%M:%S"),
                 "end": end.strftime("%H:%M:%S"),
                 "duration": format_hms(seconds),
+                "run_length": format_hms(run_length) if run_length is not None else "",
+                "custom_length": bool(row.get("LopLengde")),
                 "nr": nr,
                 "navn": navn,
                 "klubb": klubb,
@@ -771,7 +789,9 @@ def build_startliste(
             add("pause", water_seconds, "", water_label, "", item)
         elif not is_cancelled(item.get("Påmelding", "")):
             nr += 1
-            add("run", run_seconds + ready_seconds, nr, display_name(item), item.get("Organisation", ""), item)
+            # LopLengde (sekunder) overstyrer standard lengde på løp for én utøver.
+            run = item.get("LopLengde") or run_seconds
+            add("run", run + ready_seconds, nr, display_name(item), item.get("Organisation", ""), item, run)
     return entries
 
 
@@ -792,7 +812,8 @@ def generate_startliste_excel(entries, out_path, title, log):
     def write_sheet(ws, with_duration):
         ws.append([title])
         ws.append([])
-        headers = ["Nr.", "Start", "", "Slutt"] + (["Tidsforbruk"] if with_duration else []) + ["Navn", "Klubb"]
+        headers = (["Nr.", "Start", "", "Slutt", "Lengde på løp"]
+                   + (["Sammenlagt tidsforbruk"] if with_duration else []) + ["Navn", "Klubb"])
         ws.append(headers)
         for cell in ws[3]:
             cell.font = bold
@@ -806,13 +827,14 @@ def generate_startliste_excel(entries, out_path, title, log):
                 if group > 1:
                     start = f"ca. {start}"
             duration = [entry["duration"]] if with_duration else []
-            ws.append([entry["nr"], start, "-", entry["end"]] + duration + [entry["navn"], entry["klubb"]])
+            ws.append([entry["nr"], start, "-", entry["end"], entry["run_length"]] + duration
+                      + [entry["navn"], entry["klubb"]])
             if entry["is_group"]:
                 for cell in ws[ws.max_row]:
                     cell.font = bold
                     cell.fill = group_fill
 
-        widths = [6, 10, 3, 10] + ([12] if with_duration else []) + [38, 16]
+        widths = [6, 10, 3, 10, 14] + ([22] if with_duration else []) + [38, 16]
         for idx, width in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = width
         ws.append([])
@@ -858,17 +880,21 @@ def generate_startliste_pdf(entries, out_path, title, log):
     except Exception:
         font_name = "Helvetica"
 
-    data = [["Nr.", "Start", "", "Slutt", "Tidsforbruk", "Navn", "Klubb"]]
     body_style = ParagraphStyle(
         "BodyCell",
         fontName=font_name,
         fontSize=10,
         leading=11,
     )
+    # De lange overskriftene brytes over to linjer.
+    head_style = ParagraphStyle("HeadCell", fontName=font_name, fontSize=11, leading=12, alignment=1)
+    data = [["Nr.", "Start", "", "Slutt", Paragraph("Lengde på løp", head_style),
+             Paragraph("Sammenlagt tidsforbruk", head_style), "Navn", "Klubb"]]
     for entry in entries:
         name_cell = Paragraph(entry["navn"], body_style)
         club_cell = Paragraph(entry["klubb"], body_style)
-        data.append([entry["nr"], entry["start"], "-", entry["end"], entry["duration"], name_cell, club_cell])
+        data.append([entry["nr"], entry["start"], "-", entry["end"], entry["run_length"], entry["duration"],
+                     name_cell, club_cell])
 
     doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
@@ -882,7 +908,7 @@ def generate_startliste_pdf(entries, out_path, title, log):
     generated_ts = format_generated_ts()
     story = [Paragraph(title, title_style), Spacer(1, 8)]
 
-    col_widths = [26, 56, 10, 56, 62, 190, 123]
+    col_widths = [26, 52, 10, 52, 54, 74, 145, 110]
     table = Table(data, repeatRows=1, colWidths=col_widths)
     style_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#ADADAD")),
@@ -890,7 +916,7 @@ def generate_startliste_pdf(entries, out_path, title, log):
         ("FONTNAME", (0, 1), (-1, -1), font_name),
         ("FONTSIZE", (0, 0), (-1, 0), 11),
         ("FONTSIZE", (0, 1), (-1, -1), 10),
-        ("ALIGN", (0, 0), (4, -1), "CENTER"),
+        ("ALIGN", (0, 0), (5, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 1),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
@@ -963,6 +989,37 @@ def generate_vlc_playlist(rows, out_dir, base_name, music_zip, log):
     playlist_path.write_text("\n".join(lines), encoding="utf-8")
     log(f"Spilleliste skrevet: {playlist_path}")
     return True
+
+
+def colorref(color):
+    # "#RRGGBB" -> Windows COLORREF (0x00BBGGRR).
+    red, green, blue = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+    return blue << 16 | green << 8 | red
+
+
+def style_window_frame(win):
+    # Tittellinje og vinduskant i appens farger. Windows 11 tar fargene direkte,
+    # Windows 10 får bare mørk tittellinje. Andre systemer lar vi være.
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        attributes = (
+            (20, 1),                 # DWMWA_USE_IMMERSIVE_DARK_MODE
+            (34, colorref(LINE)),    # DWMWA_BORDER_COLOR
+            (35, colorref(BG)),      # DWMWA_CAPTION_COLOR
+            (36, colorref(TEXT)),    # DWMWA_TEXT_COLOR
+        )
+        for attribute, value in attributes:
+            value = ctypes.c_int(value)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+            )
+    except Exception:
+        pass
 
 
 class App:
@@ -1074,10 +1131,13 @@ class App:
                     indicatorforeground=ACCENT)
         s.map("TCheckbutton", background=[("active", PANEL)], indicatorbackground=[("selected", FIELD)])
 
-        s.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        s.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0),
+                    bordercolor=BG, lightcolor=BG, darkcolor=BG)
         s.configure("TNotebook.Tab", background=BG, foreground=TEXT_DIM, padding=(16, 7),
-                    bordercolor=BG, font=f["body"])
-        s.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", TEXT)])
+                    bordercolor=BG, lightcolor=BG, darkcolor=BG, font=f["body"])
+        # clam-temaet gir fanene lyse kanter via lightcolor; de settes til fanens egen farge.
+        s.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", TEXT)],
+              lightcolor=[("selected", PANEL), ("", BG)])
 
         s.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=TEXT,
                     rowheight=26, bordercolor=LINE, font=f["body"])
@@ -1097,6 +1157,7 @@ class App:
         self.start_time_var = tk.StringVar(value="18:00")
         self.interval_var = tk.StringVar(value="3:10")
         self.ready_var = tk.StringVar(value="0:30")
+        self.group_count_var = tk.StringVar(value="2")
         self.group_size_var = tk.StringVar(value="8")
         self.warmup_var = tk.StringVar(value="4:00")
         self.water_count_var = tk.StringVar(value="0")
@@ -1109,6 +1170,7 @@ class App:
             "start": self.start_time_var,
             "lengde_lop": self.interval_var,
             "klart_til_neste": self.ready_var,
+            "antall_oppvarmingsgrupper": self.group_count_var,
             "utovere_per_gruppe": self.group_size_var,
             "oppvarming": self.warmup_var,
             "antall_vanningspauser": self.water_count_var,
@@ -1124,6 +1186,7 @@ class App:
             self.water_duration_var,
         ):
             var.trace_add("write", lambda *_: self.refresh_schedule())
+        self.group_count_var.trace_add("write", lambda *_: self.on_group_count_change())
         self.group_size_var.trace_add("write", lambda *_: self.on_layout_setting_change(regroup=True))
         self.water_count_var.trace_add("write", lambda *_: self.on_layout_setting_change(regroup=False))
         self.new_name_var = tk.StringVar()
@@ -1133,9 +1196,26 @@ class App:
         self.var_html = tk.BooleanVar(value=True)
 
     def _build_menu(self):
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
-        menu_file = tk.Menu(menubar, tearoff=0)
+        # Egen menylinje, siden Windows' innebygde menylinje ikke kan farges.
+        menubar = tk.Frame(self.root, bg=BG)
+        menubar.pack(side="top", fill="x", padx=(8, 0))
+        tk.Frame(self.root, bg=LINE, height=1).pack(side="top", fill="x")
+        self.menu_options = dict(
+            tearoff=0, bg=PANEL, fg=TEXT, activebackground=ACCENT, activeforeground=ACCENT_TEXT,
+            selectcolor=TEXT, disabledforeground=TEXT_DISABLED, relief="flat", bd=0,
+            font=self.fonts["body"],
+        )
+
+        def add_menu(label):
+            button = tk.Menubutton(menubar, text=label, underline=0, bg=BG, fg=TEXT,
+                                   activebackground=BUTTON_HOVER, activeforeground=TEXT, relief="flat",
+                                   bd=0, padx=10, pady=4, font=self.fonts["body"])
+            button.pack(side="left")
+            menu = tk.Menu(button, **self.menu_options)
+            button.configure(menu=menu)
+            return menu
+
+        menu_file = add_menu("Fil")
         menu_file.add_command(label="Hent deltakerliste fra isonen…", command=self.load_isonen)
         menu_file.add_command(label="Velg musikk-zip…", command=self.choose_music_zip)
         menu_file.add_command(
@@ -1148,20 +1228,16 @@ class App:
         menu_file.add_command(label="Lagre oppsett som…", command=lambda: self.save_setup(ask=True))
         menu_file.add_separator()
         menu_file.add_command(label="Avslutt", command=self.on_close)
-        menu_reports = tk.Menu(menubar, tearoff=0)
+        menu_reports = add_menu("Rapporter")
         menu_reports.add_command(label="Lag deltakerrapport", command=self.generate_files)
         menu_reports.add_checkbutton(label="PDF", variable=self.var_pdf)
         menu_reports.add_checkbutton(label="Excel", variable=self.var_excel)
         menu_reports.add_checkbutton(label="HTML", variable=self.var_html)
-        menu_settings = tk.Menu(menubar, tearoff=0)
-        self.menu_tabellvisning = tk.Menu(menu_settings, tearoff=0)
+        menu_settings = add_menu("Innstillinger")
+        self.menu_tabellvisning = tk.Menu(menu_settings, **self.menu_options)
         menu_settings.add_cascade(label="Kolonner i stevnetabellen", menu=self.menu_tabellvisning)
-        menu_help = tk.Menu(menubar, tearoff=0)
+        menu_help = add_menu("Hjelp")
         menu_help.add_command(label="Om", command=self.show_about)
-        menubar.add_cascade(label="Fil", menu=menu_file)
-        menubar.add_cascade(label="Rapporter", menu=menu_reports)
-        menubar.add_cascade(label="Innstillinger", menu=menu_settings)
-        menubar.add_cascade(label="Hjelp", menu=menu_help)
         self.root.bind_all("<Control-s>", lambda e: self.save_setup())
         self.root.bind_all("<Control-o>", lambda e: self.open_setup())
 
@@ -1222,6 +1298,7 @@ class App:
             ("Start kl.", self.start_time_var, 8, None),
             ("Lengde på løp", self.interval_var, 8, None),
             ("Klart til neste løp", self.ready_var, 8, None),
+            ("Antall oppvarmingsgrupper", self.group_count_var, 6, (0, 40)),
             ("Utøvere per gruppe", self.group_size_var, 6, (1, 40)),
             ("Oppvarming per gruppe", self.warmup_var, 8, None),
             ("Antall vanningspauser", self.water_count_var, 6, (0, 20)),
@@ -1244,6 +1321,9 @@ class App:
             if widget is None:
                 widget = ttk.Entry(form, textvariable=var, width=width, font=self.fonts["body"])
             widget.grid(row=i, column=1, sticky="w", pady=3)
+            if var is self.group_size_var:
+                self.group_size_widget = widget
+        self.update_group_size_state()
         row = len(fields) + 1
         ttk.Label(
             form,
@@ -1284,7 +1364,8 @@ class App:
             "start": ("Start", 90, "center"),
             "dash": ("", 24, "center"),
             "slutt": ("Slutt", 90, "center"),
-            "tid": ("Tidsforbruk", 100, "center"),
+            "lengde": ("Lengde på løp", 110, "center"),
+            "tid": ("Sammenlagt tidsforbruk", 170, "center"),
             "navn": ("Navn", 260, "w"),
             "klubb": ("Klubb", 200, "w"),
         }
@@ -1302,6 +1383,13 @@ class App:
         self.schedule_tree.bind("<Leave>", lambda e: self.hide_tip())
         self.schedule_tree.bind("<Double-1>", lambda e: self.edit_selected())
         self.schedule_tree.bind("<Delete>", lambda e: self.delete_selected())
+        self.schedule_tree.bind("<Button-3>", self.on_schedule_right_click)
+        self.schedule_menu = tk.Menu(self.schedule_tree, **self.menu_options)
+        self.schedule_menu.add_command(label="Endre lengde på løp…", command=self.edit_run_length)
+        self.schedule_menu.add_command(label="Bruk standard lengde", command=self.reset_run_length)
+        self.schedule_menu.add_separator()
+        self.schedule_menu.add_command(label="Rediger", command=self.edit_selected)
+        self.schedule_menu.add_command(label="Slett", command=self.delete_selected)
         self.schedule_tree.bind("<Alt-Up>", lambda e: self.move_selected(-1) or "break")
         self.schedule_tree.bind("<Alt-Down>", lambda e: self.move_selected(1) or "break")
         self.schedule_tree.bind("<ButtonPress-1>", self.on_drag_start)
@@ -1330,7 +1418,8 @@ class App:
             ("Eksporter til Excel", self.export_excel, 16),
         ):
             ttk.Button(side, text=text, command=command, width=16).pack(fill="x", pady=(gap, 0))
-        ttk.Label(side, text="Dra rader med musen,\neller bruk Alt+↑/↓.\nDobbeltklikk redigerer.",
+        ttk.Label(side, text="Dra rader med musen,\neller bruk Alt+↑/↓.\nDobbeltklikk redigerer.\n"
+                             "Høyreklikk en utøver for\nå endre lengde på løp.",
                   style="PanelDim.TLabel", justify="left").pack(anchor="w", pady=(16, 0))
 
     # -------------------- Fane: Stevne --------------------
@@ -1539,10 +1628,41 @@ class App:
             "water_seconds": water_seconds,
         }
 
-    def relayout(self):
+    def group_count(self):
+        return max(0, self.read_int(self.group_count_var, 0))
+
+    def group_limit(self):
+        # Maks utøvere per gruppe. Med 0 eller 1 gruppe er det ingen grense.
+        return self.read_int(self.group_size_var, 8) if self.group_count() > 1 else float("inf")
+
+    def set_auto_group_size(self):
+        self._loading = True
+        try:
+            self.group_size_var.set(str(auto_group_size(len(self.active_rows()), self.group_count())))
+        finally:
+            self._loading = False
+
+    def update_group_size_state(self):
+        # «Utøvere per gruppe» kan bare velges når det er minst 2 grupper.
+        if hasattr(self, "group_size_widget"):
+            self.group_size_widget.configure(state="normal" if self.group_count() > 1 else "disabled")
+
+    def relayout(self, auto_size=False):
+        if auto_size:
+            self.set_auto_group_size()
         self.items = layout_items(
-            self.rows, self.read_int(self.group_size_var, 8), self.read_int(self.water_count_var, 0)
+            self.rows,
+            self.group_count(),
+            self.read_int(self.group_size_var, 8),
+            self.read_int(self.water_count_var, 0),
         )
+
+    def on_group_count_change(self):
+        self.update_group_size_state()
+        if self._loading:
+            return
+        self.relayout(auto_size=True)
+        self.refresh_schedule()
 
     def on_layout_setting_change(self, regroup):
         if self._loading:
@@ -1553,9 +1673,11 @@ class App:
             self.items = place_water_pauses(self.items, self.read_int(self.water_count_var, 0))
         self.refresh_schedule()
 
-    def sync_water_count(self):
+    def sync_marker_counts(self):
+        # Oppdaterer antall grupper og vanningspauser etter det som faktisk står i tidsplanen.
         self._loading = True
         try:
+            self.group_count_var.set(str(sum(1 for i in self.items if i.get("Kind") == "warmup")))
             self.water_count_var.set(str(sum(1 for i in self.items if i.get("Kind") == "pause")))
         finally:
             self._loading = False
@@ -1586,7 +1708,7 @@ class App:
         tree = self.schedule_tree
         tree.delete(*tree.get_children())
         positions = {id(item): i for i, item in enumerate(self.items)}
-        group_size = self.read_int(self.group_size_var, 8)
+        group_size = self.group_limit()
         overflows = group_overflows(self.items, group_size)
         self.overflow_tips = {}
         select_iid = None
@@ -1608,8 +1730,9 @@ class App:
                     f"Flytt {extra} utøver{'e' if extra > 1 else ''} til en annen gruppe, "
                     "eller øk «Utøvere per gruppe»."
                 )
+            run_length = entry["run_length"] + (" *" if entry["custom_length"] else "")
             tree.insert("", "end", iid=iid, tags=tags, values=(
-                entry["nr"], entry["start"], "-", entry["end"], entry["duration"],
+                entry["nr"], entry["start"], "-", entry["end"], run_length, entry["duration"],
                 entry["navn"], entry["klubb"],
             ))
         if select_iid:
@@ -1623,13 +1746,15 @@ class App:
         else:
             groups = sum(1 for e in self.entries if e["kind"] == "warmup")
             pauses = sum(1 for e in self.entries if e["kind"] == "pause")
-            text = (
-                f"{runners} utøvere · {groups} oppvarmingsgrupper · "
-                f"{pauses} vanningspauser · ferdig kl. {self.entries[-1]['end']}"
-            )
+            parts = [f"{runners} utøvere"]
+            if groups:
+                parts.append(f"{groups} oppvarmingsgruppe{'r' if groups > 1 else ''}")
+            parts += [f"{pauses} vanningspauser", f"ferdig kl. {self.entries[-1]['end']}"]
+            text = " · ".join(parts)
             wanted = self.read_int(self.water_count_var, 0)
             if pauses < wanted:
-                text += f" (bare {pauses} vanningspauser får plass mellom gruppene)"
+                where = "mellom gruppene" if groups else "mellom utøverne"
+                text += f" (bare {pauses} vanningspauser får plass {where})"
             if overflows:
                 text += f" · {len(overflows)} gruppe{'r' if len(overflows) > 1 else ''} har for mange utøvere"
                 self.summary_label.configure(style="PanelWarn.TLabel")
@@ -1643,18 +1768,10 @@ class App:
             self.name_entry.focus_set()
             return
         row = new_participant(given, family, self.new_club_var.get())
-        # Ny oppvarmingsgruppe når den siste gruppen er full (eller det ikke finnes noen).
-        in_last_group = 0
-        has_group = False
-        for item in reversed(self.visible_items()):
-            if item.get("Kind") == "warmup":
-                has_group = True
-                break
-            if not is_marker(item):
-                in_last_group += 1
-        if not has_group or in_last_group >= self.read_int(self.group_size_var, 8):
-            self.items.append({"Kind": "warmup"})
+        # Utøveren havner i siste gruppe. Finnes ingen grupper ennå, lages de på nytt.
         self.items.append(row)
+        if self.group_count() and not any(i.get("Kind") == "warmup" for i in self.items):
+            self.relayout(auto_size=True)
         self.match_missing_music()
         self.new_name_var.set("")
         self.name_entry.focus_set()
@@ -1683,9 +1800,56 @@ class App:
         self.match_missing_music()
         self.refresh_schedule(select=row)
 
+    def on_schedule_right_click(self, event):
+        iid = self.schedule_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.schedule_tree.selection_set(iid)
+        self.schedule_tree.focus(iid)
+        row = self.selected_item()
+        if row is None or is_marker(row):
+            return
+        self.hide_tip()
+        self.schedule_menu.entryconfigure(1, state="normal" if row.get("LopLengde") else "disabled")
+        try:
+            self.schedule_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.schedule_menu.grab_release()
+
+    def edit_run_length(self):
+        row = self.selected_item()
+        if row is None or is_marker(row):
+            return
+        standard = parse_duration_mmss(self.interval_var.get())
+        value = simpledialog.askstring(
+            "Lengde på løp",
+            f"Lengde på løp for {display_name(row)} (M:SS):",
+            initialvalue=format_duration(row.get("LopLengde") or standard),
+            parent=self.root,
+        )
+        if value is None:
+            return
+        seconds = parse_duration_mmss(value.strip())
+        if not seconds:
+            messagebox.showerror("Ugyldig lengde", "Ugyldig lengde på løp. Bruk M:SS.", parent=self.root)
+            return
+        if seconds == standard:
+            row.pop("LopLengde", None)
+        else:
+            row["LopLengde"] = seconds
+        self.log(f"Lengde på løp for {display_name(row)}: {format_duration(seconds)}")
+        self.refresh_schedule(select=row)
+
+    def reset_run_length(self):
+        row = self.selected_item()
+        if row is None or is_marker(row) or not row.pop("LopLengde", None):
+            return
+        self.log(f"{display_name(row)} bruker standard lengde på løp.")
+        self.refresh_schedule(select=row)
+
     def move_item(self, src, dst):
         # Etter pop havner raden under målet når den flyttes ned, og over når den flyttes opp.
-        group_size = self.read_int(self.group_size_var, 8)
+        group_size = self.group_limit()
         before = group_overflows(self.items, group_size)
         item = self.items.pop(src)
         self.items.insert(dst, item)
@@ -1776,7 +1940,7 @@ class App:
         visible = self.visible_items()
         pos = next(i for i, x in enumerate(visible) if x is item)
         del self.items[self.index_of(item)]
-        self.sync_water_count()
+        self.sync_marker_counts()
         self.log(f"Slettet {navn}.")
         remaining = self.visible_items()
         self.refresh_schedule(select=remaining[min(pos, len(remaining) - 1)] if remaining else None)
@@ -1882,6 +2046,8 @@ class App:
         finally:
             self._loading = False
         self.items = [item for item in data["items"] if isinstance(item, dict)]
+        # Gamle oppsett mangler antall grupper; tidsplanen i filen bestemmer.
+        self.sync_marker_counts()
         self.source_dir = Path(data["source_dir"]) if data.get("source_dir") else None
         self.zip_path = None
         music = data.get("music_zip")
@@ -1919,7 +2085,7 @@ class App:
             self.log(f"{cancelled} avmeldte er tatt ut av tidsplanen.")
         if self.music_files:
             self.match_all_music()
-        self.relayout()
+        self.relayout(auto_size=True)
         self.refresh_schedule()
 
     def choose_music_zip(self):
@@ -1973,7 +2139,7 @@ class App:
         elif self.music_files:
             self.match_all_music()
         self.log(f"Totalt deltakere: {len(self.rows)}")
-        self.relayout()
+        self.relayout(auto_size=True)
         self.refresh_schedule()
 
     def match_fms_data(self, zip_path):
@@ -2649,7 +2815,7 @@ class App:
             new_rows.extend(bucket)
         self.rows = new_rows
         self.match_missing_music()
-        self.relayout()
+        self.relayout(auto_size=True)
         self.refresh_schedule()
         self.log(f"Lastet gammel rekkefølge-fil: {path}")
 
@@ -2732,6 +2898,7 @@ class App:
         win = tk.Toplevel(self.root, bg=BG)
         win.title(title)
         win.resizable(False, False)
+        style_window_frame(win)
         frame = ttk.Frame(win, padding=16)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text=text).pack(anchor="w")
@@ -2759,6 +2926,7 @@ class App:
         about = tk.Toplevel(self.root, bg=BG)
         about.title("Om")
         about.resizable(False, False)
+        style_window_frame(about)
         frame = ttk.Frame(about, padding=20)
         frame.pack(fill="both", expand=True)
 
@@ -2793,6 +2961,7 @@ class App:
 def main():
     root = tk.Tk()
     App(root)
+    style_window_frame(root)
     root.update_idletasks()
     width = int(root.winfo_screenwidth() * 0.85)
     height = int(root.winfo_screenheight() * 0.85)
