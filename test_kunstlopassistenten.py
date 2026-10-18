@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 from datetime import datetime
 
-from fsm_gui import (
+from kunstlopassistenten import (
     App,
     build_startliste,
     detect_audio_format,
@@ -278,7 +278,7 @@ class TableInteractionTests(unittest.TestCase):
         app.table_column_vars = {"startnummer": FakeVariable(False)}
         app.tree = FakeTree(app.table_columns)
 
-        with patch("fsm_gui.messagebox.showinfo") as showinfo:
+        with patch("kunstlopassistenten.messagebox.showinfo") as showinfo:
             app.update_visible_table_columns("startnummer")
 
         self.assertTrue(app.table_column_vars["startnummer"].get())
@@ -293,7 +293,7 @@ class TableInteractionTests(unittest.TestCase):
         app.refresh_table = Mock()
         event = SimpleNamespace(x=10, y=10)
 
-        with patch("fsm_gui.messagebox.askyesno", return_value=True) as askyesno:
+        with patch("kunstlopassistenten.messagebox.askyesno", return_value=True) as askyesno:
             result = app.on_tree_checkbox_click(event)
 
         self.assertEqual(result, "break")
@@ -310,7 +310,7 @@ class TableInteractionTests(unittest.TestCase):
         app.refresh_table = Mock()
         event = SimpleNamespace(x=10, y=10)
 
-        with patch("fsm_gui.messagebox.askyesno", return_value=False) as askyesno:
+        with patch("kunstlopassistenten.messagebox.askyesno", return_value=False) as askyesno:
             result = app.on_tree_checkbox_click(event)
 
         self.assertEqual(result, "break")

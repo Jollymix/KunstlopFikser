@@ -3,19 +3,19 @@ setlocal
 cd /d "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" "fsm_gui.py"
+    ".venv\Scripts\python.exe" "kunstlopassistenten.py"
     goto :finished
 )
 
 where py >nul 2>&1
 if not errorlevel 1 (
-    py -3 "fsm_gui.py"
+    py -3 "kunstlopassistenten.py"
     goto :finished
 )
 
 where python >nul 2>&1
 if not errorlevel 1 (
-    python "fsm_gui.py"
+    python "kunstlopassistenten.py"
     goto :finished
 )
 
