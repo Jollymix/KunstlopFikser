@@ -13,8 +13,12 @@ from fsm_gui import (
     App,
     build_startliste,
     detect_audio_format,
+    generate_startliste_excel,
     get_audio_duration,
+    group_overflows,
+    layout_items,
     new_participant,
+    place_water_pauses,
     water_pause_positions,
 )
 
@@ -121,8 +125,9 @@ class ScheduleTests(unittest.TestCase):
         return [new_participant(f"Løper{i}", "Test", "Loddefjord IL") for i in range(1, count + 1)]
 
     def test_groups_warmup_and_times(self):
+        items = layout_items(self.runners(3), 2, 0)
         entries = build_startliste(
-            self.runners(3), 2, 220, datetime(2000, 1, 1, 8, 15), warmup_seconds=240
+            items, 190, datetime(2000, 1, 1, 8, 15), ready_seconds=30, warmup_seconds=240
         )
 
         self.assertEqual(
@@ -137,24 +142,70 @@ class ScheduleTests(unittest.TestCase):
         )
         self.assertEqual([e["nr"] for e in entries if not e["is_group"]], [1, 2, 3])
 
-    def test_gap_between_runs_inside_group(self):
-        entries = build_startliste(self.runners(2), 8, 220, datetime(2000, 1, 1, 8, 0), gap_seconds=20)
+    def test_cancelled_runners_are_hidden_last(self):
+        rows = self.runners(3)
+        rows[0]["Påmelding"] = "Avmeldt"
 
-        self.assertEqual(entries[2]["start"], "08:04:00")
+        items = layout_items(rows, 8, 0)
+
+        self.assertIs(items[-1], rows[0])
+        entries = build_startliste(items, 60, datetime(2000, 1, 1, 8, 0))
+        self.assertEqual([e["navn"] for e in entries if e["kind"] == "run"], ["Løper2 Test", "Løper3 Test"])
 
     def test_water_pauses_between_groups(self):
         self.assertEqual(water_pause_positions(4, 1), [2])
         self.assertEqual(water_pause_positions(4, 2), [1, 3])
         self.assertEqual(water_pause_positions(1, 1), [])
 
-        entries = build_startliste(
-            self.runners(4), 2, 60, datetime(2000, 1, 1, 8, 0), water_count=1, water_seconds=900
-        )
+        items = layout_items(self.runners(4), 2, 1)
+        entries = build_startliste(items, 60, datetime(2000, 1, 1, 8, 0), water_seconds=900)
 
-        pause = [e for e in entries if e["kind"] == "pause"]
-        self.assertEqual(len(pause), 1)
-        self.assertEqual((pause[0]["start"], pause[0]["end"]), ("08:02:00", "08:17:00"))
-        self.assertEqual(entries[entries.index(pause[0]) + 1]["navn"], "Oppvarmingsgruppe 2")
+        self.assertEqual([e["kind"] for e in entries],
+                         ["warmup", "run", "run", "pause", "warmup", "run", "run"])
+        self.assertEqual((entries[3]["start"], entries[3]["end"]), ("08:02:00", "08:17:00"))
+
+    def test_detects_group_with_too_many_runners(self):
+        items = layout_items(self.runners(4), 2, 0)
+        self.assertEqual(group_overflows(items, 2), {})
+
+        runner = items.pop(4)  # første utøver i gruppe 2 flyttes inn i gruppe 1
+        items.insert(1, runner)
+
+        self.assertEqual(group_overflows(items, 2), {id(items[0]): 3})
+
+    def test_excel_has_original_sheet_and_sheet_with_duration(self):
+        import openpyxl
+
+        items = layout_items(self.runners(3), 2, 0)
+        entries = build_startliste(items, 190, datetime(2000, 1, 1, 8, 15), ready_seconds=30,
+                                   warmup_seconds=240)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "startliste.xlsx")
+            self.assertTrue(generate_startliste_excel(entries, path, "Tittel", Mock()))
+            wb = openpyxl.load_workbook(path)
+
+        self.assertEqual(wb.sheetnames, ["Startliste", "Med tidsforbruk"])
+        plain, timed = wb["Startliste"], wb["Med tidsforbruk"]
+        self.assertEqual([c.value for c in plain[3]], ["Nr.", "Start", None, "Slutt", "Navn", "Klubb"])
+        self.assertEqual([c.value for c in plain[4]][1:5],
+                         ["08:15:00", "-", "08:19:00", "Oppvarmingsgruppe 1"])
+        self.assertEqual(plain["B7"].value, "ca. 08:26:20")
+        self.assertEqual([c.value for c in timed[3]],
+                         ["Nr.", "Start", None, "Slutt", "Tidsforbruk", "Navn", "Klubb"])
+        self.assertEqual([c.value for c in timed[5]], [1, "08:19:00", "-", "08:22:40", "00:03:40",
+                                                       "Løper1 Test", "Loddefjord IL"])
+
+    def test_moved_water_pause_keeps_its_place_until_count_changes(self):
+        items = layout_items(self.runners(4), 2, 1)
+        pause = items.pop(3)
+        items.insert(1, pause)
+
+        entries = build_startliste(items, 60, datetime(2000, 1, 1, 8, 0), water_seconds=600)
+        self.assertEqual(entries[1]["kind"], "pause")
+
+        replaced = place_water_pauses(items, 1)
+        self.assertEqual([i.get("Kind", "run") for i in replaced],
+                         ["warmup", "run", "run", "pause", "warmup", "run", "run"])
 
 
 class AudioCacheTests(unittest.TestCase):

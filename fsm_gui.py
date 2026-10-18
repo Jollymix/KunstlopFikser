@@ -37,6 +37,8 @@ WARN = "#F2B33D"
 GOOD = "#86D9A3"
 BAD = "#F87171"
 
+SETUP_FILETYPES = [("Oppsett", "*.json"), ("Alle filer", "*.*")]
+
 
 def decode_xml_bytes(data):
     try:
@@ -690,26 +692,59 @@ def water_pause_positions(group_count, water_count):
     return sorted(p for p in positions if 0 < p < group_count)
 
 
+def is_marker(item):
+    return item.get("Kind") in ("warmup", "pause")
+
+
+def place_water_pauses(items, water_count):
+    # Fjerner gamle vanningspauser og legger nye jevnt fordelt foran oppvarmingsgruppene.
+    items = [item for item in items if item.get("Kind") != "pause"]
+    warmups = [k for k, item in enumerate(items) if item.get("Kind") == "warmup"]
+    for position in reversed(water_pause_positions(len(warmups), water_count)):
+        items.insert(warmups[position], {"Kind": "pause"})
+    return items
+
+
+def layout_items(rows, group_size, water_count):
+    # Lager rekkefølgen oppvarmingsgruppe, utøvere, ... Avmeldte legges skjult bakerst.
+    group_size = max(1, group_size)
+    active = [r for r in rows if not is_cancelled(r.get("Påmelding", ""))]
+    items = []
+    for start in range(0, len(active), group_size):
+        items.append({"Kind": "warmup"})
+        items.extend(active[start : start + group_size])
+    items.extend(r for r in rows if is_cancelled(r.get("Påmelding", "")))
+    return place_water_pauses(items, water_count)
+
+
+def group_overflows(items, group_size):
+    # {id(oppvarmingsrad): antall utøvere} for grupper med flere utøvere enn tillatt.
+    counts = {}
+    current = None
+    for item in items:
+        if item.get("Kind") == "warmup":
+            current = id(item)
+            counts[current] = 0
+        elif current is not None and not is_marker(item) and not is_cancelled(item.get("Påmelding", "")):
+            counts[current] += 1
+    return {key: count for key, count in counts.items() if count > group_size}
+
+
 def build_startliste(
-    rows,
-    group_size,
+    items,
     run_seconds,
     start_time,
+    ready_seconds=0,
     warmup_seconds=0,
-    gap_seconds=0,
-    water_count=0,
     water_seconds=0,
     water_label="Vanningspause",
 ):
     entries = []
-    if not rows:
-        return entries
-    group_size = max(1, group_size)
-    group_count = -(-len(rows) // group_size)
-    water_after = set(water_pause_positions(group_count, water_count)) if water_seconds > 0 else set()
     current = start_time
+    group = 0
+    nr = 0
 
-    def add(kind, seconds, nr, navn, klubb, row=None):
+    def add(kind, seconds, nr, navn, klubb, row):
         nonlocal current
         end = current + timedelta(seconds=seconds)
         entries.append(
@@ -727,16 +762,16 @@ def build_startliste(
         )
         current = end
 
-    for group in range(group_count):
-        add("warmup", warmup_seconds, "", f"Oppvarmingsgruppe {group + 1}", "")
-        group_rows = rows[group * group_size : (group + 1) * group_size]
-        for offset, row in enumerate(group_rows):
-            if offset and gap_seconds:
-                current += timedelta(seconds=gap_seconds)
-            nr = group * group_size + offset + 1
-            add("run", run_seconds, nr, display_name(row), row.get("Organisation", ""), row)
-        if group + 1 in water_after:
-            add("pause", water_seconds, "", water_label, "")
+    for item in items:
+        kind = item.get("Kind")
+        if kind == "warmup":
+            group += 1
+            add("warmup", warmup_seconds, "", f"Oppvarmingsgruppe {group}", "", item)
+        elif kind == "pause":
+            add("pause", water_seconds, "", water_label, "", item)
+        elif not is_cancelled(item.get("Påmelding", "")):
+            nr += 1
+            add("run", run_seconds + ready_seconds, nr, display_name(item), item.get("Organisation", ""), item)
     return entries
 
 
@@ -749,45 +784,45 @@ def generate_startliste_excel(entries, out_path, title, log):
         log("Mangler openpyxl. Installer med: pip install openpyxl")
         return False
 
+    header_fill = PatternFill(start_color="ADADAD", end_color="ADADAD", fill_type="solid")
+    group_fill = PatternFill(start_color="D0D0D0", end_color="D0D0D0", fill_type="solid")
+    bold = Font(bold=True)
+    generated_ts = format_generated_ts()
+
+    def write_sheet(ws, with_duration):
+        ws.append([title])
+        ws.append([])
+        headers = ["Nr.", "Start", "", "Slutt"] + (["Tidsforbruk"] if with_duration else []) + ["Navn", "Klubb"]
+        ws.append(headers)
+        for cell in ws[3]:
+            cell.font = bold
+            cell.fill = header_fill
+
+        group = 0
+        for entry in entries:
+            start = entry["start"]
+            if entry["kind"] == "warmup":
+                group += 1
+                if group > 1:
+                    start = f"ca. {start}"
+            duration = [entry["duration"]] if with_duration else []
+            ws.append([entry["nr"], start, "-", entry["end"]] + duration + [entry["navn"], entry["klubb"]])
+            if entry["is_group"]:
+                for cell in ws[ws.max_row]:
+                    cell.font = bold
+                    cell.fill = group_fill
+
+        widths = [6, 10, 3, 10] + ([12] if with_duration else []) + [38, 16]
+        for idx, width in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(idx)].width = width
+        ws.append([])
+        ws.append([generated_ts])
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Startliste"
-
-    ws.append([title])
-    ws.append([])
-    headers = ["Nr.", "Start", "", "Slutt", "Tidsforbruk", "Navn", "Klubb"]
-    ws.append(headers)
-
-    header_font = Font(bold=True)
-    for cell in ws[3]:
-        cell.font = header_font
-
-    header_fill = PatternFill(start_color="ADADAD", end_color="ADADAD", fill_type="solid")
-    group_fill = PatternFill(start_color="D0D0D0", end_color="D0D0D0", fill_type="solid")
-    group_font = Font(bold=True)
-
-    for entry in entries:
-        ws.append(
-            [entry["nr"], entry["start"], "-", entry["end"], entry["duration"], entry["navn"], entry["klubb"]]
-        )
-        if entry["is_group"]:
-            for cell in ws[ws.max_row]:
-                cell.font = group_font
-                cell.fill = group_fill
-    for cell in ws[3]:
-        cell.fill = header_fill
-
-    ws.column_dimensions[get_column_letter(1)].width = 6
-    ws.column_dimensions[get_column_letter(2)].width = 10
-    ws.column_dimensions[get_column_letter(3)].width = 3
-    ws.column_dimensions[get_column_letter(4)].width = 10
-    ws.column_dimensions[get_column_letter(5)].width = 12
-    ws.column_dimensions[get_column_letter(6)].width = 38
-    ws.column_dimensions[get_column_letter(7)].width = 24
-
-    generated_ts = format_generated_ts()
-    ws.append([])
-    ws.append([generated_ts])
+    write_sheet(ws, with_duration=False)
+    write_sheet(wb.create_sheet("Med tidsforbruk"), with_duration=True)
 
     try:
         wb.save(out_path)
@@ -933,8 +968,16 @@ def generate_vlc_playlist(rows, out_dir, base_name, music_zip, log):
 class App:
     def __init__(self, root):
         self.root = root
-        self.rows = []
+        # Hele tidsplanen i rekkefølge: utøvere (deltaker-dict) og markører for
+        # oppvarmingsgrupper og vanningspauser ({"Kind": "warmup"/"pause"}).
+        self.items = []
         self.entries = []
+        self.setup_path = None
+        self.dirty = False
+        self._loading = False
+        self.drag_iid = None
+        self.overflow_tips = {}
+        self.tip = None
         self.zip_path = None
         self.source_dir = None
         self.music_zip = None
@@ -958,9 +1001,19 @@ class App:
         self._build_menu()
         self._build()
         self.refresh_schedule()
+        self.dirty = False
+        self.update_title()
         self.update_player_ui()
         self.update_clock()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    @property
+    def rows(self):
+        return [item for item in self.items if not is_marker(item)]
+
+    @rows.setter
+    def rows(self, value):
+        self.items = list(value)
 
     # -------------------- Oppsett --------------------
     def _init_fonts(self):
@@ -975,7 +1028,7 @@ class App:
             "small": (cond, 10),
             "head": (semi, 13),
             "title": (semi, 16),
-            "clock": (semi, 40),
+            "clock": (semi, 96),
             "mono": (mono, 10),
         }
 
@@ -1000,7 +1053,6 @@ class App:
         s.configure("TLabel", background=BG, foreground=TEXT)
         s.configure("Title.TLabel", font=f["title"])
         s.configure("Dim.TLabel", foreground=TEXT_DIM, font=f["small"])
-        s.configure("Clock.TLabel", font=f["clock"])
         s.configure("Panel.TLabel", background=PANEL)
         s.configure("PanelDim.TLabel", background=PANEL, foreground=TEXT_DIM, font=f["small"])
         s.configure("PanelHead.TLabel", background=PANEL, font=f["head"])
@@ -1043,22 +1095,37 @@ class App:
         self.location_var = tk.StringVar(value="Iskanten")
         self.start_date_var = tk.StringVar(value=datetime.now().strftime("%d.%m.%y"))
         self.start_time_var = tk.StringVar(value="18:00")
-        self.interval_var = tk.StringVar(value="3:40")
-        self.gap_var = tk.StringVar(value="0:00")
+        self.interval_var = tk.StringVar(value="3:10")
+        self.ready_var = tk.StringVar(value="0:30")
         self.group_size_var = tk.StringVar(value="8")
         self.warmup_var = tk.StringVar(value="4:00")
         self.water_count_var = tk.StringVar(value="0")
         self.water_duration_var = tk.StringVar(value="15:00")
+        # Feltene som lagres i oppsettfilen.
+        self.setup_vars = {
+            "stevne": self.event_name_var,
+            "sted": self.location_var,
+            "dato": self.start_date_var,
+            "start": self.start_time_var,
+            "lengde_lop": self.interval_var,
+            "klart_til_neste": self.ready_var,
+            "utovere_per_gruppe": self.group_size_var,
+            "oppvarming": self.warmup_var,
+            "antall_vanningspauser": self.water_count_var,
+            "lengde_vanningspause": self.water_duration_var,
+        }
+        for var in (self.event_name_var, self.location_var, self.start_date_var):
+            var.trace_add("write", lambda *_: self.mark_dirty())
         for var in (
             self.start_time_var,
             self.interval_var,
-            self.gap_var,
-            self.group_size_var,
+            self.ready_var,
             self.warmup_var,
-            self.water_count_var,
             self.water_duration_var,
         ):
             var.trace_add("write", lambda *_: self.refresh_schedule())
+        self.group_size_var.trace_add("write", lambda *_: self.on_layout_setting_change(regroup=True))
+        self.water_count_var.trace_add("write", lambda *_: self.on_layout_setting_change(regroup=False))
         self.new_name_var = tk.StringVar()
         self.new_club_var = tk.StringVar()
         self.var_pdf = tk.BooleanVar(value=False)
@@ -1075,9 +1142,10 @@ class App:
             label="Skann mappe (isonen, FMS-data og musikk)…", command=self.scan_folder
         )
         menu_file.add_separator()
-        menu_file.add_command(label="Ny tom liste", command=self.clear_rows)
-        menu_file.add_command(label="Lagre rekkefølge…", command=self.save_order)
-        menu_file.add_command(label="Last rekkefølge…", command=self.load_order)
+        menu_file.add_command(label="Nytt oppsett", command=self.clear_rows)
+        menu_file.add_command(label="Åpne oppsett…", accelerator="Ctrl+O", command=self.open_setup)
+        menu_file.add_command(label="Lagre oppsett", accelerator="Ctrl+S", command=self.save_setup)
+        menu_file.add_command(label="Lagre oppsett som…", command=lambda: self.save_setup(ask=True))
         menu_file.add_separator()
         menu_file.add_command(label="Avslutt", command=self.on_close)
         menu_reports = tk.Menu(menubar, tearoff=0)
@@ -1087,13 +1155,15 @@ class App:
         menu_reports.add_checkbutton(label="HTML", variable=self.var_html)
         menu_settings = tk.Menu(menubar, tearoff=0)
         self.menu_tabellvisning = tk.Menu(menu_settings, tearoff=0)
-        menu_settings.add_cascade(label="Kolonner i musikktabellen", menu=self.menu_tabellvisning)
+        menu_settings.add_cascade(label="Kolonner i stevnetabellen", menu=self.menu_tabellvisning)
         menu_help = tk.Menu(menubar, tearoff=0)
         menu_help.add_command(label="Om", command=self.show_about)
         menubar.add_cascade(label="Fil", menu=menu_file)
         menubar.add_cascade(label="Rapporter", menu=menu_reports)
         menubar.add_cascade(label="Innstillinger", menu=menu_settings)
         menubar.add_cascade(label="Hjelp", menu=menu_help)
+        self.root.bind_all("<Control-s>", lambda e: self.save_setup())
+        self.root.bind_all("<Control-o>", lambda e: self.open_setup())
 
     def _build(self):
         r = self.root
@@ -1109,8 +1179,6 @@ class App:
             value="Hent en deltakerliste fra isonen, eller legg inn utøvere manuelt."
         )
         ttk.Label(title_box, textvariable=self.status_var, style="Dim.TLabel").pack(anchor="w")
-        self.clock_var = tk.StringVar(value="00:00:00")
-        ttk.Label(top, textvariable=self.clock_var, style="Clock.TLabel").pack(side="right")
 
         log_panel = ttk.Frame(r, style="Panel.TFrame", padding=(14, 8))
         log_panel.pack(side="bottom", fill="x", padx=18, pady=(0, 18))
@@ -1139,7 +1207,7 @@ class App:
 
     # -------------------- Fane: Tidsplan --------------------
     def _tab_schedule(self, nb):
-        p = self._panel(nb, "Tidsplan")
+        p = self._panel(nb, "Tidsplan/planlegging")
         p.columnconfigure(1, weight=1)
         p.rowconfigure(0, weight=1)
 
@@ -1153,7 +1221,7 @@ class App:
             ("Dato", self.start_date_var, 10, "date"),
             ("Start kl.", self.start_time_var, 8, None),
             ("Lengde på løp", self.interval_var, 8, None),
-            ("Pause mellom løp", self.gap_var, 8, None),
+            ("Klart til neste løp", self.ready_var, 8, None),
             ("Utøvere per gruppe", self.group_size_var, 6, (1, 40)),
             ("Oppvarming per gruppe", self.warmup_var, 8, None),
             ("Antall vanningspauser", self.water_count_var, 6, (0, 20)),
@@ -1177,8 +1245,13 @@ class App:
                 widget = ttk.Entry(form, textvariable=var, width=width, font=self.fonts["body"])
             widget.grid(row=i, column=1, sticky="w", pady=3)
         row = len(fields) + 1
-        ttk.Label(form, text="Tider skrives som M:SS, starttid som TT:MM.", style="PanelDim.TLabel").grid(
-            row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(
+            form,
+            text="Tider skrives som M:SS, starttid som TT:MM.\n"
+                 "Lengde på løp + klart til neste løp = tid per utøver.",
+            style="PanelDim.TLabel",
+            justify="left",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         ttk.Label(form, text="Legg til utøver", style="PanelHead.TLabel").grid(
             row=row + 1, column=0, columnspan=2, sticky="w", pady=(22, 8))
@@ -1197,8 +1270,10 @@ class App:
         actions = ttk.Frame(form, style="Panel.TFrame")
         actions.grid(row=row + 5, column=0, columnspan=2, sticky="we", pady=(24, 0))
         ttk.Button(actions, text="Hent fra isonen…", command=self.load_isonen).pack(fill="x")
+        ttk.Button(actions, text="Åpne oppsett…", command=self.open_setup).pack(fill="x", pady=(8, 0))
+        ttk.Button(actions, text="Lagre oppsett", command=self.save_setup).pack(fill="x", pady=(8, 0))
         ttk.Button(actions, text="Lagre startliste (Excel + PDF)", style="Accent.TButton",
-                   command=self.generate_startliste).pack(fill="x", pady=(8, 0))
+                   command=self.generate_startliste).pack(fill="x", pady=(16, 0))
 
         table = ttk.Frame(p, style="Panel.TFrame")
         table.grid(row=0, column=1, sticky="nsew")
@@ -1221,10 +1296,18 @@ class App:
         self.schedule_tree.tag_configure("warmup", background=GROUP_BG, font=self.fonts["bold"])
         self.schedule_tree.tag_configure("pause", background=GROUP_BG, foreground=WARN,
                                          font=self.fonts["bold"])
+        self.schedule_tree.tag_configure("overfull", background=WARN, foreground=ACCENT_TEXT,
+                                         font=self.fonts["bold"])
+        self.schedule_tree.bind("<Motion>", self.on_schedule_hover)
+        self.schedule_tree.bind("<Leave>", lambda e: self.hide_tip())
         self.schedule_tree.bind("<Double-1>", lambda e: self.edit_selected())
         self.schedule_tree.bind("<Delete>", lambda e: self.delete_selected())
         self.schedule_tree.bind("<Alt-Up>", lambda e: self.move_selected(-1) or "break")
         self.schedule_tree.bind("<Alt-Down>", lambda e: self.move_selected(1) or "break")
+        self.schedule_tree.bind("<ButtonPress-1>", self.on_drag_start)
+        self.schedule_tree.bind("<B1-Motion>", self.on_drag_motion)
+        self.schedule_tree.bind("<ButtonRelease-1>", self.on_drag_drop)
+        self.drop_line = tk.Frame(self.schedule_tree, bg=ACCENT, height=3)
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.schedule_tree.yview)
         self.schedule_tree.configure(yscrollcommand=scroll.set)
         self.schedule_tree.grid(row=0, column=0, sticky="nsew")
@@ -1244,19 +1327,35 @@ class App:
             ("Randomiser", self.shuffle_rows, 16),
             ("Sorter fornavn", self.sort_by_given, 4),
             ("Sorter etternavn", self.sort_by_family, 4),
+            ("Eksporter til Excel", self.export_excel, 16),
         ):
             ttk.Button(side, text=text, command=command, width=16).pack(fill="x", pady=(gap, 0))
-        ttk.Label(side, text="Alt+↑/↓ flytter.\nDobbeltklikk redigerer.", style="PanelDim.TLabel",
-                  justify="left").pack(anchor="w", pady=(16, 0))
+        ttk.Label(side, text="Dra rader med musen,\neller bruk Alt+↑/↓.\nDobbeltklikk redigerer.",
+                  style="PanelDim.TLabel", justify="left").pack(anchor="w", pady=(16, 0))
 
-    # -------------------- Fane: Musikk --------------------
+    # -------------------- Fane: Stevne --------------------
     def _tab_music(self, nb):
-        p = self._panel(nb, "Musikk")
+        p = self._panel(nb, "Stevne")
         p.columnconfigure(0, weight=1)
-        p.rowconfigure(1, weight=1)
+        p.rowconfigure(2, weight=1)
+
+        # Bahnschrift har ulik bredde på sifrene, så hvert tegn får en fast plass for å unngå at klokka hopper.
+        clock_font = tkfont.Font(font=self.fonts["clock"])
+        digit_w = max(clock_font.measure(d) for d in "0123456789")
+        colon_w = clock_font.measure(":")
+        widths = [digit_w, digit_w, colon_w, digit_w, digit_w, colon_w, digit_w, digit_w]
+        self.clock_canvas = tk.Canvas(p, width=sum(widths), height=clock_font.metrics("linespace"),
+                                      bg=PANEL, highlightthickness=0)
+        self.clock_canvas.grid(row=0, column=0, pady=(0, 12))
+        self.clock_items = []
+        x = 0
+        for width in widths:
+            self.clock_items.append(self.clock_canvas.create_text(
+                x + width / 2, 0, anchor="n", text="0", fill=TEXT, font=clock_font))
+            x += width
 
         bar = ttk.Frame(p, style="Panel.TFrame")
-        bar.grid(row=0, column=0, sticky="we", pady=(0, 12))
+        bar.grid(row=1, column=0, sticky="we", pady=(0, 12))
         ttk.Button(bar, text="Velg musikk-zip…", style="Accent.TButton",
                    command=self.choose_music_zip).pack(side="left")
         ttk.Button(bar, text="Lag spilleliste", command=self.generate_playlist_only).pack(
@@ -1268,7 +1367,7 @@ class App:
             side="left", padx=(16, 0))
 
         table = ttk.Frame(p, style="Panel.TFrame")
-        table.grid(row=1, column=0, sticky="nsew")
+        table.grid(row=2, column=0, sticky="nsew")
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
         columns = {
@@ -1300,7 +1399,7 @@ class App:
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
         ttk.Label(p, text="Dobbeltklikk eller Enter spiller lydfilen. Klikk i «Løp gjennomført» for å krysse av.",
-                  style="PanelDim.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 0))
+                  style="PanelDim.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         self.table_columns = tuple(columns)
         self.table_column_vars = {}
@@ -1316,7 +1415,7 @@ class App:
         self.menu_tabellvisning.add_command(label="Vis alle kolonner", command=self.show_all_table_columns)
 
         player = ttk.Frame(p, style="Panel.TFrame")
-        player.grid(row=3, column=0, sticky="we", pady=(16, 0))
+        player.grid(row=4, column=0, sticky="we", pady=(16, 0))
         self.btn_player_play_pause = ttk.Button(player, textvariable=self.play_pause_text,
                                                 style="Accent.TButton", command=self.toggle_play_pause,
                                                 width=8)
@@ -1339,7 +1438,8 @@ class App:
         self.root.update_idletasks()
 
     def update_clock(self):
-        self.clock_var.set(datetime.now().strftime("%H:%M:%S"))
+        for item, char in zip(self.clock_items, datetime.now().strftime("%H:%M:%S")):
+            self.clock_canvas.itemconfigure(item, text=char)
         self.root.after(500, self.update_clock)
 
     def output_dir(self):
@@ -1350,11 +1450,16 @@ class App:
     def active_rows(self):
         return [r for r in self.rows if not is_cancelled(r.get("Påmelding", ""))]
 
-    def index_of(self, row):
-        return next((i for i, r in enumerate(self.rows) if r is row), None)
+    def visible_items(self):
+        return [i for i in self.items if is_marker(i) or not is_cancelled(i.get("Påmelding", ""))]
+
+    def index_of(self, item):
+        return next((i for i, x in enumerate(self.items) if x is item), None)
 
     def confirm_replace(self):
-        if not self.rows:
+        if self.dirty:
+            return self.confirm_discard()
+        if not self.items:
             return True
         return messagebox.askyesno(
             "Erstatte listen?",
@@ -1362,9 +1467,33 @@ class App:
             parent=self.root,
         )
 
+    def confirm_discard(self):
+        if not self.dirty or not self.items:
+            return True
+        answer = messagebox.askyesnocancel(
+            "Ulagrede endringer",
+            "Oppsettet har endringer som ikke er lagret. Vil du lagre først?",
+            parent=self.root,
+        )
+        if answer is None:
+            return False
+        return self.save_setup() if answer else True
+
+    def mark_dirty(self):
+        if self._loading:
+            return
+        self.dirty = True
+        self.update_title()
+
+    def update_title(self):
+        name = self.setup_path.name if self.setup_path else "Nytt oppsett"
+        self.root.title(f"{APP_NAME} – {name}{' *' if self.dirty else ''}")
+
     def update_status(self):
         parts = []
-        if self.source_dir:
+        if self.setup_path:
+            parts.append(f"Oppsett: {self.setup_path}")
+        elif self.source_dir:
             parts.append(f"Kilde: {self.source_dir}")
         parts.append(f"{len(self.active_rows())} utøvere")
         if self.music_zip:
@@ -1379,6 +1508,13 @@ class App:
             return 0
         return parse_duration_mmss(value)
 
+    @staticmethod
+    def read_int(var, default):
+        try:
+            return int(var.get())
+        except (ValueError, tk.TclError):
+            return default
+
     def read_schedule_settings(self):
         start = parse_time_hhmm(self.start_time_var.get())
         if not start:
@@ -1386,43 +1522,56 @@ class App:
         run_seconds = parse_duration_mmss(self.interval_var.get())
         if not run_seconds:
             return "Ugyldig lengde på løp. Bruk M:SS."
-        gap = self.parse_optional_duration(self.gap_var.get())
-        if gap is None:
-            return "Ugyldig pause mellom løp. Bruk M:SS."
+        ready = self.parse_optional_duration(self.ready_var.get())
+        if ready is None:
+            return "Ugyldig «klart til neste løp». Bruk M:SS."
         warmup = self.parse_optional_duration(self.warmup_var.get())
         if warmup is None:
             return "Ugyldig oppvarming. Bruk M:SS."
         water_seconds = self.parse_optional_duration(self.water_duration_var.get())
         if water_seconds is None:
             return "Ugyldig lengde på vanningspause. Bruk M:SS."
-        try:
-            group_size = int(self.group_size_var.get())
-            water_count = int(self.water_count_var.get() or 0)
-        except ValueError:
-            return "Utøvere per gruppe og antall vanningspauser må være hele tall."
-        if group_size <= 0 or water_count < 0:
-            return "Utøvere per gruppe må være minst 1."
         return {
-            "group_size": group_size,
             "run_seconds": run_seconds,
             "start_time": start,
+            "ready_seconds": ready,
             "warmup_seconds": warmup,
-            "gap_seconds": gap,
-            "water_count": water_count,
             "water_seconds": water_seconds,
         }
 
-    def selected_schedule_row(self):
+    def relayout(self):
+        self.items = layout_items(
+            self.rows, self.read_int(self.group_size_var, 8), self.read_int(self.water_count_var, 0)
+        )
+
+    def on_layout_setting_change(self, regroup):
+        if self._loading:
+            return
+        if regroup:
+            self.relayout()
+        else:
+            self.items = place_water_pauses(self.items, self.read_int(self.water_count_var, 0))
+        self.refresh_schedule()
+
+    def sync_water_count(self):
+        self._loading = True
+        try:
+            self.water_count_var.set(str(sum(1 for i in self.items if i.get("Kind") == "pause")))
+        finally:
+            self._loading = False
+
+    def selected_item(self):
         selected = self.schedule_tree.selection()
-        if not selected or not selected[0].startswith("r"):
+        if not selected:
             return None
-        return self.rows[int(selected[0][1:])]
+        return self.items[int(selected[0][1:])]
 
     def refresh_schedule(self, select=None):
         if not hasattr(self, "schedule_tree"):
             return
         if select is None:
-            select = self.selected_schedule_row()
+            select = self.selected_item()
+        self.mark_dirty()
         settings = self.read_schedule_settings()
         if isinstance(settings, str):
             self.summary_label.configure(style="PanelWarn.TLabel")
@@ -1430,26 +1579,35 @@ class App:
             return
         self.summary_label.configure(style="PanelDim.TLabel")
 
-        active = self.active_rows()
-        self.entries = build_startliste(active, **settings)
+        self.entries = build_startliste(self.items, **settings)
         for row in self.rows:
             row["StartTid"] = ""
             row["SluttTid"] = ""
         tree = self.schedule_tree
         tree.delete(*tree.get_children())
-        positions = {id(r): i for i, r in enumerate(self.rows)}
+        positions = {id(item): i for i, item in enumerate(self.items)}
+        group_size = self.read_int(self.group_size_var, 8)
+        overflows = group_overflows(self.items, group_size)
+        self.overflow_tips = {}
         select_iid = None
-        for i, entry in enumerate(self.entries):
-            row = entry["row"]
-            if row is not None:
-                row["StartTid"] = entry["start"]
-                row["SluttTid"] = entry["end"]
-                iid = f"r{positions[id(row)]}"
-                if row is select:
-                    select_iid = iid
-            else:
-                iid = f"g{i}"
+        for entry in self.entries:
+            item = entry["row"]
+            iid = f"i{positions[id(item)]}"
+            if item is select:
+                select_iid = iid
+            if entry["kind"] == "run":
+                item["StartTid"] = entry["start"]
+                item["SluttTid"] = entry["end"]
             tags = () if entry["kind"] == "run" else (entry["kind"],)
+            count = overflows.get(id(item))
+            if count:
+                tags = ("overfull",)
+                extra = count - group_size
+                self.overflow_tips[iid] = (
+                    f"{entry['navn']} har {count} utøvere, men maks er {group_size}.\n"
+                    f"Flytt {extra} utøver{'e' if extra > 1 else ''} til en annen gruppe, "
+                    "eller øk «Utøvere per gruppe»."
+                )
             tree.insert("", "end", iid=iid, tags=tags, values=(
                 entry["nr"], entry["start"], "-", entry["end"], entry["duration"],
                 entry["navn"], entry["klubb"],
@@ -1459,17 +1617,22 @@ class App:
             tree.focus(select_iid)
             tree.see(select_iid)
 
-        if not active:
+        runners = sum(1 for e in self.entries if e["kind"] == "run")
+        if not runners:
             self.summary_var.set("Ingen utøvere ennå. Hent fra isonen eller legg til manuelt.")
         else:
-            groups = -(-len(active) // settings["group_size"])
-            placed = sum(1 for e in self.entries if e["kind"] == "pause")
+            groups = sum(1 for e in self.entries if e["kind"] == "warmup")
+            pauses = sum(1 for e in self.entries if e["kind"] == "pause")
             text = (
-                f"{len(active)} utøvere · {groups} oppvarmingsgrupper · "
-                f"{placed} vanningspauser · ferdig kl. {self.entries[-1]['end']}"
+                f"{runners} utøvere · {groups} oppvarmingsgrupper · "
+                f"{pauses} vanningspauser · ferdig kl. {self.entries[-1]['end']}"
             )
-            if settings["water_seconds"] and placed < settings["water_count"]:
-                text += f" (bare {placed} vanningspauser får plass mellom gruppene)"
+            wanted = self.read_int(self.water_count_var, 0)
+            if pauses < wanted:
+                text += f" (bare {pauses} vanningspauser får plass mellom gruppene)"
+            if overflows:
+                text += f" · {len(overflows)} gruppe{'r' if len(overflows) > 1 else ''} har for mange utøvere"
+                self.summary_label.configure(style="PanelWarn.TLabel")
             self.summary_var.set(text)
         self.update_status()
         self.refresh_table()
@@ -1480,7 +1643,18 @@ class App:
             self.name_entry.focus_set()
             return
         row = new_participant(given, family, self.new_club_var.get())
-        self.rows.append(row)
+        # Ny oppvarmingsgruppe når den siste gruppen er full (eller det ikke finnes noen).
+        in_last_group = 0
+        has_group = False
+        for item in reversed(self.visible_items()):
+            if item.get("Kind") == "warmup":
+                has_group = True
+                break
+            if not is_marker(item):
+                in_last_group += 1
+        if not has_group or in_last_group >= self.read_int(self.group_size_var, 8):
+            self.items.append({"Kind": "warmup"})
+        self.items.append(row)
         self.match_missing_music()
         self.new_name_var.set("")
         self.name_entry.focus_set()
@@ -1488,8 +1662,8 @@ class App:
         self.refresh_schedule(select=row)
 
     def edit_selected(self):
-        row = self.selected_schedule_row()
-        if row is None:
+        row = self.selected_item()
+        if row is None or is_marker(row):
             return
         name = simpledialog.askstring("Rediger utøver", "Navn:", initialvalue=display_name(row),
                                       parent=self.root)
@@ -1509,54 +1683,218 @@ class App:
         self.match_missing_music()
         self.refresh_schedule(select=row)
 
+    def move_item(self, src, dst):
+        # Etter pop havner raden under målet når den flyttes ned, og over når den flyttes opp.
+        group_size = self.read_int(self.group_size_var, 8)
+        before = group_overflows(self.items, group_size)
+        item = self.items.pop(src)
+        self.items.insert(dst, item)
+        self.refresh_schedule(select=item)
+        after = group_overflows(self.items, group_size)
+        grown = [key for key, count in after.items() if count > before.get(key, 0)]
+        if grown:
+            iids = {f"i{k}": id(x) for k, x in enumerate(self.items)}
+            tips = [tip for iid, tip in self.overflow_tips.items() if iids.get(iid) in grown]
+            messagebox.showwarning("For mange utøvere i gruppen", "\n\n".join(tips), parent=self.root)
+
+    def on_schedule_hover(self, event):
+        tip = self.overflow_tips.get(self.schedule_tree.identify_row(event.y))
+        if not tip:
+            self.hide_tip()
+            return
+        if self.tip is None:
+            self.tip = tk.Toplevel(self.root)
+            self.tip.overrideredirect(True)
+            self.tip.attributes("-topmost", True)
+            self.tip_label = tk.Label(self.tip, bg=PANEL, fg=TEXT, font=self.fonts["body"], justify="left",
+                                      wraplength=380, padx=10, pady=6, highlightthickness=2,
+                                      highlightbackground=WARN)
+            self.tip_label.pack()
+        self.tip_label.configure(text=tip)
+        self.tip.geometry(f"+{event.x_root + 14}+{event.y_root + 18}")
+        self.tip.deiconify()
+
+    def hide_tip(self):
+        if self.tip is not None:
+            self.tip.withdraw()
+
     def move_selected(self, delta):
-        row = self.selected_schedule_row()
-        if row is None:
-            messagebox.showinfo("Info", "Velg en utøver i tabellen først.")
+        item = self.selected_item()
+        if item is None:
+            messagebox.showinfo("Info", "Velg en rad i tabellen først.")
             return
-        active = self.active_rows()
-        pos = next(i for i, r in enumerate(active) if r is row)
+        visible = self.visible_items()
+        pos = next(i for i, x in enumerate(visible) if x is item)
         target = pos + delta
-        if target < 0 or target >= len(active):
+        if 0 <= target < len(visible):
+            self.move_item(self.index_of(item), self.index_of(visible[target]))
+
+    def on_drag_start(self, event):
+        self.hide_tip()
+        self.drag_iid = self.schedule_tree.identify_row(event.y) or None
+
+    def on_drag_motion(self, event):
+        tree = self.schedule_tree
+        if not self.drag_iid:
             return
-        a, b = self.index_of(row), self.index_of(active[target])
-        self.rows[a], self.rows[b] = self.rows[b], self.rows[a]
-        self.refresh_schedule(select=row)
+        if event.y < 30:
+            tree.yview_scroll(-1, "units")
+        elif event.y > tree.winfo_height() - 10:
+            tree.yview_scroll(1, "units")
+        target = tree.identify_row(event.y)
+        bbox = tree.bbox(target) if target and target != self.drag_iid else None
+        if not bbox:
+            self.drop_line.place_forget()
+            return
+        _, y, _, height = bbox
+        below = tree.index(target) > tree.index(self.drag_iid)
+        self.drop_line.place(x=0, y=y + height - 2 if below else y - 1, relwidth=1)
+        tree.configure(cursor="sb_v_double_arrow")
+
+    def on_drag_drop(self, event):
+        self.drop_line.place_forget()
+        self.schedule_tree.configure(cursor="")
+        source, self.drag_iid = self.drag_iid, None
+        target = self.schedule_tree.identify_row(event.y)
+        if source and target and source != target:
+            self.move_item(int(source[1:]), int(target[1:]))
 
     def delete_selected(self):
-        row = self.selected_schedule_row()
-        if row is None:
-            messagebox.showinfo("Info", "Velg en utøver i tabellen først.")
+        item = self.selected_item()
+        if item is None:
+            messagebox.showinfo("Info", "Velg en rad i tabellen først.")
             return
-        navn = display_name(row)
-        if not messagebox.askyesno("Bekreft sletting", f"Slette valgt utøver?\n\n{navn}"):
+        if item.get("Kind") == "pause":
+            navn, question = "vanningspause", "Slette valgt vanningspause?"
+        elif item.get("Kind") == "warmup":
+            navn, question = "oppvarmingsgruppe", "Slette valgt oppvarmingsgruppe?\n\nUtøverne blir stående."
+        else:
+            navn = display_name(item)
+            question = f"Slette valgt utøver?\n\n{navn}"
+        if not messagebox.askyesno("Bekreft sletting", question):
             return
-        active = self.active_rows()
-        pos = next(i for i, r in enumerate(active) if r is row)
-        del self.rows[self.index_of(row)]
-        self.log(f"Slettet utøver: {navn}")
-        remaining = self.active_rows()
+        visible = self.visible_items()
+        pos = next(i for i, x in enumerate(visible) if x is item)
+        del self.items[self.index_of(item)]
+        self.sync_water_count()
+        self.log(f"Slettet {navn}.")
+        remaining = self.visible_items()
         self.refresh_schedule(select=remaining[min(pos, len(remaining) - 1)] if remaining else None)
 
-    def shuffle_rows(self):
-        random.shuffle(self.rows)
+    def set_runner_order(self, runners):
+        # Bytter rekkefølgen på utøverne, men lar grupper og pauser stå på sine plasser.
+        slots = [k for k, item in enumerate(self.items) if not is_marker(item)]
+        for slot, row in zip(slots, runners):
+            self.items[slot] = row
         self.refresh_schedule()
+
+    def shuffle_rows(self):
+        runners = self.rows
+        random.shuffle(runners)
+        self.set_runner_order(runners)
 
     def sort_by_given(self):
-        self.rows.sort(key=lambda r: (normalize_text(r.get("GivenName")), normalize_text(r.get("FamilyName"))))
-        self.refresh_schedule()
+        self.set_runner_order(sorted(
+            self.rows, key=lambda r: (normalize_text(r.get("GivenName")), normalize_text(r.get("FamilyName")))
+        ))
 
     def sort_by_family(self):
-        self.rows.sort(key=lambda r: (normalize_text(r.get("FamilyName")), normalize_text(r.get("GivenName"))))
-        self.refresh_schedule()
+        self.set_runner_order(sorted(
+            self.rows, key=lambda r: (normalize_text(r.get("FamilyName")), normalize_text(r.get("GivenName")))
+        ))
 
     def clear_rows(self):
-        if self.rows and not messagebox.askyesno("Ny tom liste", "Fjerne alle utøvere fra listen?"):
+        if not self.confirm_discard():
             return
-        self.rows = []
+        self.items = []
         self.zip_path = None
-        self.log("Startet en ny tom liste.")
+        self.setup_path = None
+        self.log("Startet et nytt oppsett.")
         self.refresh_schedule()
+        self.dirty = False
+        self.update_title()
+
+    # -------------------- Oppsettfil --------------------
+    def save_setup(self, ask=False):
+        path = self.setup_path
+        if ask or not path:
+            date_obj = parse_date_ddmmyy(self.start_date_var.get())
+            date_part = date_obj.strftime("%Y-%m-%d") if date_obj else "dato"
+            location = self.location_var.get().strip() or "sted"
+            path = filedialog.asksaveasfilename(
+                title="Lagre oppsett",
+                defaultextension=".json",
+                filetypes=SETUP_FILETYPES,
+                initialfile=sanitize_filename(f"Oppsett_{location}_{date_part}") + ".json",
+                initialdir=str(path.parent if path else self.output_dir()),
+            )
+            if not path:
+                return False
+            path = Path(path)
+        data = {
+            "type": "kunstlopassistenten-oppsett",
+            "version": 1,
+            "saved": datetime.now().isoformat(timespec="seconds"),
+            "settings": {key: var.get() for key, var in self.setup_vars.items()},
+            "source_dir": str(self.source_dir) if self.source_dir else "",
+            "music_zip": str(self.music_zip) if self.music_zip else "",
+            "items": self.items,
+        }
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke lagre oppsettet:\n{exc}")
+            return False
+        self.setup_path = path
+        self.dirty = False
+        self.update_title()
+        self.update_status()
+        self.log(f"Lagret oppsett: {path}")
+        return True
+
+    def open_setup(self):
+        if not self.confirm_discard():
+            return
+        path = filedialog.askopenfilename(
+            title="Åpne oppsett",
+            filetypes=SETUP_FILETYPES,
+            initialdir=str(self.setup_path.parent if self.setup_path else self.output_dir()),
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke lese oppsettet:\n{exc}")
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            if isinstance(data, dict) and isinstance(data.get("order"), list):
+                self.load_legacy_order(data["order"], path)
+            else:
+                messagebox.showerror("Feil", "Filen er ikke et oppsett fra Kunstløpassistenten.")
+            return
+
+        self._loading = True
+        try:
+            for key, value in (data.get("settings") or {}).items():
+                if key in self.setup_vars:
+                    self.setup_vars[key].set(value)
+        finally:
+            self._loading = False
+        self.items = [item for item in data["items"] if isinstance(item, dict)]
+        self.source_dir = Path(data["source_dir"]) if data.get("source_dir") else None
+        self.zip_path = None
+        music = data.get("music_zip")
+        if music and Path(music).is_file():
+            self.load_music_zip(music, match=False)
+            self.match_missing_music()
+        elif music:
+            self.log(f"Fant ikke musikk-zip fra oppsettet: {music}")
+        self.setup_path = Path(path)
+        self.refresh_schedule()
+        self.dirty = False
+        self.update_title()
+        self.log(f"Åpnet oppsett: {path}")
 
     # -------------------- Innlesing --------------------
     def load_isonen(self):
@@ -1574,12 +1912,14 @@ class App:
             return
         self.rows = rows
         self.zip_path = None
+        self.setup_path = None
         self.source_dir = Path(path).parent
         cancelled = len(rows) - len(self.active_rows())
         if cancelled:
             self.log(f"{cancelled} avmeldte er tatt ut av tidsplanen.")
         if self.music_files:
             self.match_all_music()
+        self.relayout()
         self.refresh_schedule()
 
     def choose_music_zip(self):
@@ -1617,6 +1957,7 @@ class App:
             messagebox.showerror("Feil", "Fant ingen deltakere i excel-filen.")
             return
         self.rows = rows
+        self.setup_path = None
         self.source_dir = folder
         self.zip_path = data_zips[0] if data_zips else None
         if self.zip_path:
@@ -1632,6 +1973,7 @@ class App:
         elif self.music_files:
             self.match_all_music()
         self.log(f"Totalt deltakere: {len(self.rows)}")
+        self.relayout()
         self.refresh_schedule()
 
     def match_fms_data(self, zip_path):
@@ -1713,9 +2055,9 @@ class App:
             row["NavnFraFsm"] = zip_row.get("PrintName") or display_name(row)
             row["PrintName"] = row["NavnFraFsm"]
             self.log(f"Ekstra i FSM (ny rad): {row['NavnFraFsm']}")
-            self.rows.append(row)
+            self.items.append(row)
 
-    def load_music_zip(self, music_zip):
+    def load_music_zip(self, music_zip, match=True):
         self.music_zip = Path(music_zip)
         self.music_cache_dir = None
         self.music_file_info = {}
@@ -1760,7 +2102,8 @@ class App:
             f"{errors} med ukjent format."
         )
         self.music_info_var.set(f"{self.music_zip.name} · {len(self.music_files)} lydfiler")
-        self.match_all_music()
+        if match:
+            self.match_all_music()
         return True
 
     def apply_music_match(self, row, used_files):
@@ -1959,6 +2302,7 @@ class App:
             return "break"
 
         row["LopGjennomfort"] = not completed
+        self.dirty = True
         status = "gjennomført" if not completed else "ikke gjennomført"
         self.log(f"Løpsstatus for {name}: {status}.")
         self.refresh_table()
@@ -2212,6 +2556,8 @@ class App:
         return None
 
     def on_close(self):
+        if not self.confirm_discard():
+            return
         if self.vlc_process and self.vlc_process.poll() is None:
             try:
                 self.vlc_process.terminate()
@@ -2281,66 +2627,8 @@ class App:
         event = (row.get("Event") or "").strip()
         return f"name:{given}|{family}|{event}"
 
-    def save_order(self):
-        if not self.rows:
-            messagebox.showinfo("Info", "Listen er tom.")
-            return
-        location = self.location_var.get().strip() or "sted"
-        date_raw = self.start_date_var.get().strip()
-        date_obj = parse_date_ddmmyy(date_raw)
-        date_part = date_obj.strftime("%Y-%m-%d") if date_obj else date_raw.replace(".", "-")
-        ts_filename = datetime.now().strftime("%d.%m.%Y %H.%M")
-        base_name = f"{sanitize_filename(location)}_{sanitize_filename(date_part)}_{sanitize_filename(ts_filename)}_rekkefolge.json"
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("Rekkefølge", "*.json"), ("Alle filer", "*.*")],
-            title="Lagre rekkefølge",
-            initialfile=base_name,
-            initialdir=str(self.output_dir()),
-        )
-        if not path:
-            return
-        # Navn og klubb lagres også, slik at manuelle lister kan lastes inn igjen.
-        order = [
-            {
-                "type": "row",
-                "key": self.row_key(row),
-                "given": row.get("GivenName", ""),
-                "family": row.get("FamilyName", ""),
-                "club": row.get("Organisation", ""),
-            }
-            for row in self.rows
-        ]
-        data = {
-            "version": 3,
-            "created": datetime.now().isoformat(timespec="seconds"),
-            "order": order,
-        }
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            self.log(f"Lagret rekkefølge: {path}")
-        except Exception as exc:
-            messagebox.showerror("Feil", f"Kunne ikke lagre rekkefølge: {exc}")
-
-    def load_order(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Rekkefølge", "*.json"), ("Alle filer", "*.*")],
-            title="Last rekkefølge",
-            initialdir=str(self.output_dir()),
-        )
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as exc:
-            messagebox.showerror("Feil", f"Kunne ikke lese rekkefølge: {exc}")
-            return
-        order = data.get("order") if isinstance(data, dict) else None
-        if not order or not isinstance(order, list):
-            messagebox.showerror("Feil", "Ugyldig rekkefølge-fil.")
-            return
+    def load_legacy_order(self, order, path):
+        # Gamle rekkefølge-filer: sorterer utøverne som allerede er lastet inn.
         buckets = {}
         for row in self.rows:
             buckets.setdefault(self.row_key(row), []).append(row)
@@ -2348,7 +2636,7 @@ class App:
         for item in order:
             if isinstance(item, dict):
                 if item.get("type") == "pause":
-                    continue  # Pauser regnes nå ut fra antall vanningspauser.
+                    continue
                 key = item.get("key")
             else:
                 key = item
@@ -2361,8 +2649,9 @@ class App:
             new_rows.extend(bucket)
         self.rows = new_rows
         self.match_missing_music()
+        self.relayout()
         self.refresh_schedule()
-        self.log(f"Lastet rekkefølge: {path}")
+        self.log(f"Lastet gammel rekkefølge-fil: {path}")
 
     def generate_files(self):
         if not self.rows:
@@ -2378,24 +2667,50 @@ class App:
             generate_pdf(self.rows, str(out_dir / f"{base_name}.pdf"), base_name, self.log)
         self.show_folder_link(out_dir, "Rapport ferdig", "Rapporten er lagret i:")
 
-    def generate_startliste(self):
+    def startliste_title(self):
+        # Returnerer (tittel, filnavn uten endelse), eller None etter å ha vist feilen.
         settings = self.read_schedule_settings()
         if isinstance(settings, str):
             messagebox.showerror("Feil", settings)
-            return
+            return None
         if not self.entries:
             messagebox.showwarning("Info", "Ingen utøvere i tidsplanen.")
-            return
+            return None
         date_obj = parse_date_ddmmyy(self.start_date_var.get())
         if not date_obj:
             messagebox.showerror("Feil", "Ugyldig dato. Bruk DD.MM.ÅÅ.")
-            return
+            return None
         location = self.location_var.get().strip()
         title = " ".join(
             part for part in (self.event_name_var.get().strip(), location, format_date_long(date_obj)) if part
         )
+        return title, sanitize_filename(f"Startliste_{location}_{date_obj:%Y-%m-%d}")
+
+    def export_excel(self):
+        result = self.startliste_title()
+        if not result:
+            return
+        title, base_name = result
+        path = filedialog.asksaveasfilename(
+            title="Eksporter startliste til Excel",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile=f"{base_name}.xlsx",
+            initialdir=str(self.output_dir()),
+        )
+        if not path:
+            return
+        if generate_startliste_excel(self.entries, path, title, self.log):
+            self.show_folder_link(Path(path).parent, "Startliste eksportert", "Excel-fila er lagret i:")
+        else:
+            messagebox.showerror("Feil", "Kunne ikke skrive Excel-fila. Er den åpen i Excel?")
+
+    def generate_startliste(self):
+        result = self.startliste_title()
+        if not result:
+            return
+        title, base_name = result
         out_dir = self.output_dir()
-        base_name = sanitize_filename(f"Startliste_{location}_{date_obj:%Y-%m-%d}")
         ok_excel = generate_startliste_excel(self.entries, str(out_dir / f"{base_name}.xlsx"), title, self.log)
         ok_pdf = generate_startliste_pdf(self.entries, str(out_dir / f"{base_name}.pdf"), title, self.log)
         if ok_excel or ok_pdf:
