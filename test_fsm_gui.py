@@ -7,7 +7,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from fsm_gui import App, detect_audio_format, get_audio_duration
+from datetime import datetime
+
+from fsm_gui import (
+    App,
+    build_startliste,
+    detect_audio_format,
+    get_audio_duration,
+    new_participant,
+    water_pause_positions,
+)
 
 
 class FakeVariable:
@@ -105,6 +114,47 @@ class AudioFormatTests(unittest.TestCase):
                     missing.append(entry.filename)
 
         self.assertEqual(missing, [])
+
+
+class ScheduleTests(unittest.TestCase):
+    def runners(self, count):
+        return [new_participant(f"Løper{i}", "Test", "Loddefjord IL") for i in range(1, count + 1)]
+
+    def test_groups_warmup_and_times(self):
+        entries = build_startliste(
+            self.runners(3), 2, 220, datetime(2000, 1, 1, 8, 15), warmup_seconds=240
+        )
+
+        self.assertEqual(
+            [(e["navn"], e["start"], e["end"], e["duration"]) for e in entries],
+            [
+                ("Oppvarmingsgruppe 1", "08:15:00", "08:19:00", "00:04:00"),
+                ("Løper1 Test", "08:19:00", "08:22:40", "00:03:40"),
+                ("Løper2 Test", "08:22:40", "08:26:20", "00:03:40"),
+                ("Oppvarmingsgruppe 2", "08:26:20", "08:30:20", "00:04:00"),
+                ("Løper3 Test", "08:30:20", "08:34:00", "00:03:40"),
+            ],
+        )
+        self.assertEqual([e["nr"] for e in entries if not e["is_group"]], [1, 2, 3])
+
+    def test_gap_between_runs_inside_group(self):
+        entries = build_startliste(self.runners(2), 8, 220, datetime(2000, 1, 1, 8, 0), gap_seconds=20)
+
+        self.assertEqual(entries[2]["start"], "08:04:00")
+
+    def test_water_pauses_between_groups(self):
+        self.assertEqual(water_pause_positions(4, 1), [2])
+        self.assertEqual(water_pause_positions(4, 2), [1, 3])
+        self.assertEqual(water_pause_positions(1, 1), [])
+
+        entries = build_startliste(
+            self.runners(4), 2, 60, datetime(2000, 1, 1, 8, 0), water_count=1, water_seconds=900
+        )
+
+        pause = [e for e in entries if e["kind"] == "pause"]
+        self.assertEqual(len(pause), 1)
+        self.assertEqual((pause[0]["start"], pause[0]["end"]), ("08:02:00", "08:17:00"))
+        self.assertEqual(entries[entries.index(pause[0]) + 1]["navn"], "Oppvarmingsgruppe 2")
 
 
 class AudioCacheTests(unittest.TestCase):
