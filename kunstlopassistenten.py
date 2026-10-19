@@ -1253,6 +1253,8 @@ class App:
         menu_file.add_separator()
         menu_file.add_command(label="Avslutt", command=self.on_close)
         menu_reports = add_menu("Rapporter")
+        menu_reports.add_command(label="Lagre startliste (Excel + PDF)", command=self.generate_startliste)
+        menu_reports.add_separator()
         menu_reports.add_command(label="Lag deltakerrapport", command=self.generate_files)
         menu_reports.add_checkbutton(label="PDF", variable=self.var_pdf)
         menu_reports.add_checkbutton(label="Excel", variable=self.var_excel)
@@ -1276,7 +1278,7 @@ class App:
         title_box.pack(side="left", anchor="w")
         ttk.Label(title_box, text=APP_NAME, style="Title.TLabel").pack(anchor="w")
         self.status_var = tk.StringVar(
-            value="Hent en deltakerliste fra isonen, eller legg inn utøvere manuelt."
+            value="Hent deltakere fra Fil-menyen, eller legg inn utøvere manuelt."
         )
         ttk.Label(title_box, textvariable=self.status_var, style="Dim.TLabel").pack(anchor="w")
 
@@ -1373,13 +1375,9 @@ class App:
 
         actions = ttk.Frame(form, style="Panel.TFrame")
         actions.grid(row=row + 5, column=0, columnspan=2, sticky="we", pady=(24, 0))
-        ttk.Button(actions, text="Hent fra isonen…", command=self.load_isonen).pack(fill="x")
-        ttk.Button(actions, text="Hent fra musikktjenesten…", command=self.load_music_entries).pack(
-            fill="x", pady=(8, 0))
-        ttk.Button(actions, text="Åpne oppsett…", command=self.open_setup).pack(fill="x", pady=(8, 0))
-        ttk.Button(actions, text="Lagre oppsett", command=self.save_setup).pack(fill="x", pady=(8, 0))
+        # Import, åpne og lagre ligger i Fil-menyen, så knappene ikke klippes på små skjermer.
         ttk.Button(actions, text="Lagre startliste (Excel + PDF)", style="Accent.TButton",
-                   command=self.generate_startliste).pack(fill="x", pady=(16, 0))
+                   command=self.generate_startliste).pack(fill="x")
 
         table = ttk.Frame(p, style="Panel.TFrame")
         table.grid(row=0, column=1, sticky="nsew")
@@ -1772,7 +1770,7 @@ class App:
 
         runners = sum(1 for e in self.entries if e["kind"] == "run")
         if not runners:
-            self.summary_var.set("Ingen utøvere ennå. Hent fra isonen eller legg til manuelt.")
+            self.summary_var.set("Ingen utøvere ennå. Hent deltakere fra Fil-menyen eller legg til manuelt.")
         else:
             groups = sum(1 for e in self.entries if e["kind"] == "warmup")
             pauses = sum(1 for e in self.entries if e["kind"] == "pause")
