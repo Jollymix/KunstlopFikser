@@ -1,8 +1,9 @@
 import os
 import sys
 import zipfile
-import xml.etree.ElementTree as ET
-from pathlib import Path
+import csv
+import unicodedata
+from pathlib import Path, PurePosixPath
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
 from tkinter.scrolledtext import ScrolledText
@@ -39,12 +40,18 @@ BAD = "#F87171"
 
 SETUP_FILETYPES = [("Oppsett", "*.json"), ("Alle filer", "*.*")]
 
-
-def decode_xml_bytes(data):
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("cp1252", errors="replace")
+# Programmene i musikktjenesten: mappenavn/filendelse i musikk-zip -> navn.
+SEGMENT_NAMES = {"SP": "Kortprogram", "FS": "Friløp"}
+# Status fra music-status.csv i musikk-zip.
+MUSIC_STATUS_TEXT = {
+    "included": "Mangler i zip",
+    "music missing": "Ikke lastet opp",
+    "profile not matched": "Profil ikke koblet",
+}
+AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".mp4", ".aac"}
+# Kolonner i deltakerrapporten (Excel, HTML og PDF).
+REPORT_HEADERS = ["PrintName", "Organisation", "Klasse", "Program", "Påmelding", "StartTid", "SluttTid",
+                  "MusikkStatus", "MusikkTid"]
 
 
 def safe_int(value, default=0):
@@ -58,99 +65,8 @@ def is_cancelled(status):
     return "avmeld" in (status or "").strip().lower()
 
 
-def parse_competition(xml_text, log):
-    rows = []
-    roots = []
-    try:
-        roots = [ET.fromstring(xml_text)]
-    except ET.ParseError as exc:
-        if "junk after document element" in str(exc):
-            log("XML inneholder flere dokumenter, prøver å hente alle OdfBody.")
-            for match in re.finditer(r"<OdfBody\b", xml_text):
-                start = match.start()
-                end = xml_text.find("</OdfBody>", start)
-                if end != -1:
-                    chunk = xml_text[start : end + len("</OdfBody>")]
-                    try:
-                        roots.append(ET.fromstring(chunk))
-                    except ET.ParseError:
-                        continue
-        else:
-            raise
-
-    for idx_root, root in enumerate(roots, start=1):
-        log(f"Leser OdfBody {idx_root} av {len(roots)}.")
-        comp = root.find("Competition")
-        if comp is None:
-            continue
-
-        for participant in comp.findall("Participant"):
-            given = (participant.attrib.get("GivenName") or "").strip()
-            family = (participant.attrib.get("FamilyName") or "").strip()
-            print_name = (participant.attrib.get("PrintName") or "").strip()
-            gender = (participant.attrib.get("Gender") or "").strip()
-            org = (participant.attrib.get("Organisation") or "").strip()
-            participant_code = (participant.attrib.get("Code") or "").strip()
-
-            for discipline in participant.findall("Discipline"):
-                for reg in discipline.findall("RegisteredEvent"):
-                    event_code = (reg.attrib.get("Event") or "").strip()
-                    entry_order = ""
-                    music = {}
-                    clubs = {}
-                    elements_free = []
-                    elements_short = []
-
-                    for entry in reg.findall("EventEntry"):
-                        code = (entry.attrib.get("Code") or "").strip()
-                        pos = safe_int(entry.attrib.get("Pos"))
-                        val = (entry.attrib.get("Value") or "").strip()
-
-                        if code == "ENTRY_ORDER":
-                            entry_order = val
-                        elif code == "MUSIC":
-                            if pos:
-                                music[pos] = val
-                        elif code == "CLUB":
-                            if pos:
-                                clubs[pos] = val
-                        elif code == "ELEMENT_CODE_FREE":
-                            elements_free.append((pos, val))
-                        elif code == "ELEMENT_CODE_SHORT":
-                            elements_short.append((pos, val))
-
-                    elements_free = [v for _, v in sorted(elements_free) if v]
-                    elements_short = [v for _, v in sorted(elements_short) if v]
-
-                    log(f"Leser deltager: {print_name} (Event: {event_code})")
-                    rows.append(
-                        {
-                            "PrintName": print_name,
-                            "GivenName": given,
-                            "FamilyName": family,
-                            "Gender": gender,
-                            "Organisation": org,
-                            "ParticipantCode": participant_code,
-                            "Event": event_code,
-                            "EntryOrder": entry_order,
-                            "Music1": music.get(1, ""),
-                            "Music2": music.get(2, ""),
-                            "Club1": clubs.get(1, ""),
-                            "Club2": clubs.get(2, ""),
-                            "ElementsFree": ", ".join(elements_free),
-                            "ElementsShort": ", ".join(elements_short),
-                        }
-                    )
-
-    return rows
-
-
-def normalize_name(value):
-    return " ".join((value or "").strip().lower().split())
-
-
 def normalize_text(value):
-    text = (value or "").strip().lower()
+    text = str(value or "").strip().lower()
     text = (
         text.replace("ø", "o")
         .replace("å", "a")
@@ -159,6 +75,8 @@ def normalize_text(value):
         .replace("ä", "a")
         .replace("é", "e")
     )
+    # Øvrige aksenter (ü, ñ, ...) fjernes, så navn i filnavn og lister blir like.
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return " ".join(text.split())
 
@@ -167,16 +85,90 @@ def tokenize_name(value):
     norm = normalize_text(value)
     return [t for t in norm.split() if t]
 
-def build_name_key(given, family, strict=True):
-    given_tokens = tokenize_name(given)
-    family_tokens = tokenize_name(family)
-    if not given_tokens and not family_tokens:
-        return ("", "")
-    if strict:
-        return (normalize_name(given), normalize_name(family))
-    given_primary = given_tokens[0] if given_tokens else ""
-    family_norm = " ".join(family_tokens)
-    return (given_primary, family_norm)
+
+def full_name_key(row):
+    return normalize_text(f"{row.get('GivenName', '')} {row.get('FamilyName', '')}")
+
+
+def segments_for(ovelse):
+    # «Kortprogram+Friløp» -> ["SP", "FS"]. Alt annet regnes som ett friløp.
+    text = normalize_text(ovelse)
+    segments = ["SP"] if "kortprogram" in text else []
+    if "frilop" in text or not segments:
+        segments.append("FS")
+    return segments
+
+
+def split_segments(rows):
+    # Utøvere med både kortprogram og friløp får én rad per program. Kortprogrammet
+    # beholder plassen i listen, friløpene legges bakerst i samme rekkefølge.
+    out, free_skates = [], []
+    for row in rows:
+        if row.get("Segment"):
+            out.append(row)
+            continue
+        segments = segments_for(row.get("Ovelse"))
+        row["Segment"] = segments[0]
+        out.append(row)
+        if len(segments) > 1:
+            row["Program"] = SEGMENT_NAMES["SP"]
+            copy = dict(row, Segment="FS", Program=SEGMENT_NAMES["FS"], MusikkFil="", Musikk="",
+                        MusikkStatus="", MusikkTid="", MusikkSek="", LopGjennomfort=False)
+            copy.pop("LopLengde", None)
+            free_skates.append(copy)
+    return out + free_skates
+
+
+def parse_music_path(filename):
+    # Musikktjenesten: <stevne>/<Klasse_Kjønn>/<SP|FS>/<Fornavn_Etternavn>_<SP|FS>.mp3
+    path = PurePosixPath(filename)
+    match = re.match(r"(.+)_(SP|FS)$", path.stem, re.IGNORECASE)
+    if not match:
+        return None
+    parts = path.parts
+    return {
+        "name": normalize_text(match.group(1).replace("_", " ")),
+        "segment": match.group(2).upper(),
+        "category": normalize_text(parts[-3].replace("_", " ")) if len(parts) >= 3 else "",
+    }
+
+
+def parse_music_status_csv(text):
+    # music-status.csv: Name,Club,Category,Segment,Status -> {(navn, program): status}
+    status = {}
+    for line in csv.DictReader(text.splitlines()):
+        key = (normalize_text(line.get("Name")), (line.get("Segment") or "").strip().upper())
+        status[key] = (line.get("Status") or "").strip().lower()
+    return status
+
+
+def find_music_for_row(row, music_index, used_files):
+    # Finner lydfilen for utøverens program (SP/FS) i en strukturert musikk-zip.
+    # Først eksakt navn, så fornavn + alle etternavn. Ved like navn vinner riktig klasse.
+    segment = row.get("Segment") or "FS"
+    candidates = [f for f, info in music_index.items()
+                  if info and info["segment"] == segment and f not in used_files]
+    name = full_name_key(row)
+    hits = [f for f in candidates if music_index[f]["name"] == name]
+    if not hits:
+        tokens = tokenize_name(row.get("GivenName"))[:1] + tokenize_name(row.get("FamilyName"))
+        if len(tokens) > 1:
+            hits = [f for f in candidates if set(tokens) <= set(music_index[f]["name"].split())]
+    if not hits:
+        return ""
+    klasse = normalize_text(row.get("Klasse"))
+    best = next((f for f in hits if klasse and music_index[f]["category"].startswith(klasse)), hits[0])
+    used_files.add(best)
+    return best
+
+
+def music_status_text(row, matched, status_map):
+    if matched:
+        return "OK"
+    status = status_map.get((full_name_key(row), row.get("Segment") or "FS"))
+    if status is None:
+        return "Ikke i musikktjenesten" if status_map else "Mangler musikk"
+    return MUSIC_STATUS_TEXT.get(status, status)
 
 
 def sanitize_filename(value):
@@ -270,16 +262,6 @@ def format_generated_ts():
     )
 
 
-def name_matches_filename(given, family, filename):
-    family_tokens = tokenize_name(family)
-    hay = normalize_text(filename)
-    if not family_tokens:
-        return False
-    if all(token in hay for token in family_tokens):
-        return True
-    return family_tokens[0] in hay
-
-
 def format_duration(seconds):
     if seconds is None:
         return ""
@@ -368,23 +350,19 @@ def new_participant(given, family, club="", gender="", status=""):
     return {
         "PrintName": f"{family}, {given}".strip(", "),
         "NavnFraIsonen": f"{given} {family}".strip(),
-        "NavnFraFsm": "",
         "GivenName": given,
         "FamilyName": family,
         "Gender": str(gender or "").strip(),
         "Organisation": str(club or "").strip(),
-        "ParticipantCode": "",
-        "Event": "",
-        "EntryOrder": "",
         "Påmelding": str(status or "").strip(),
-        "Music1": "",
-        "Music2": "",
-        "Club1": "",
-        "Club2": "",
-        "ElementsFree": "",
-        "ElementsShort": "",
-        "Manglende i zip": "",
+        "NifId": "",
+        "Klasse": "",
+        "Ovelse": "",
+        # Segment: SP (kortprogram) eller FS (friløp). Program settes bare når utøveren har begge.
+        "Segment": "",
+        "Program": "",
         "Musikk": "",
+        "MusikkStatus": "",
         "MusikkFil": "",
         "MusikkFormat": "",
         "MusikkFormatAvvik": False,
@@ -406,6 +384,20 @@ def split_name(full_name):
 def display_name(row):
     full = f"{row.get('GivenName', '')} {row.get('FamilyName', '')}".strip()
     return full or row.get("NavnFraIsonen") or row.get("PrintName") or ""
+
+
+def run_name(row):
+    # Navn i tidsplanen; utøvere med to program får programmet bak navnet.
+    program = row.get("Program")
+    return f"{display_name(row)} – {program}" if program else display_name(row)
+
+
+def cell_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).strip()
 
 
 def load_participants_from_excel(excel_path, log):
@@ -445,6 +437,8 @@ def load_participants_from_excel(excel_path, log):
     i_gender = idx("Kjønn")
     i_club = idx("Klubb")
     i_status = idx("Påmelding", "Påmeldingsstatus", "Deltakerstatus")
+    # Person ID er samme nummer som NIF ID i musikktjenesten.
+    extra_fields = {"NifId": idx("Person ID"), "Klasse": idx("Klasse"), "Ovelse": idx("Øvelse")}
 
     if i_given is None or i_family is None:
         log("Finner ikke nødvendige kolonner i excel (Fornavn/Etternavn).")
@@ -461,24 +455,86 @@ def load_participants_from_excel(excel_path, log):
         if not (given or family):
             continue
 
-        out.append(new_participant(given, family, club, gender, status))
+        participant = new_participant(given, family, club, gender, status)
+        for field, i in extra_fields.items():
+            if i is not None and i < len(row):
+                participant[field] = cell_text(row[i])
+        out.append(participant)
 
     log(f"Lest excel: {excel_path} ({len(out)} rader)")
     return out
 
 
-def parse_officials(xml_text, log):
+def load_entries_from_excel(excel_path, log):
+    # Deltakereksport fra musikktjenesten (entries_*.xlsx). Over tabellen står stevnenavn og
+    # «Arrangør · DD.MM.ÅÅÅÅ». Returnerer (deltakere, {"title": ..., "date": date}).
     try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return 0
-    comp = root.find("Competition")
-    if comp is None:
-        log("Ingen officials funnet i judges-filen.")
-        return 0
-    officials = comp.findall("Official")
-    log(f"Fant {len(officials)} officials i judges-filen.")
-    return len(officials)
+        import openpyxl
+    except Exception:
+        log("Mangler openpyxl. Installer med: pip install openpyxl")
+        return [], {}
+
+    try:
+        ws = openpyxl.load_workbook(excel_path).worksheets[0]
+    except Exception as exc:
+        log(f"Kunne ikke lese excel: {excel_path} ({exc})")
+        return [], {}
+
+    rows = list(ws.iter_rows(values_only=True))
+    header_row = next(
+        (i for i, row in enumerate(rows[:20])
+         if {"First name", "Last name"} <= {cell_text(c) for c in row}),
+        None,
+    )
+    if header_row is None:
+        log("Finner ikke kolonnene First name/Last name. Er dette deltakerlisten fra musikktjenesten?")
+        return [], {}
+
+    header_map = {cell_text(h): i for i, h in enumerate(rows[header_row]) if cell_text(h)}
+    columns = {
+        "GivenName": "First name",
+        "FamilyName": "Last name",
+        "Fodselsdato": "Date of birth",
+        "Gender": "Gender",
+        "Organisation": "Club",
+        "Klasse": "Category",
+        "Ovelse": "Segments",
+        "NifId": "NIF ID",
+    }
+
+    def value(row, col):
+        i = header_map.get(col)
+        return cell_text(row[i]) if i is not None and i < len(row) else ""
+
+    entries = []
+    for row in rows[header_row + 1:]:
+        entry = {field: value(row, col) for field, col in columns.items()}
+        if entry["GivenName"] or entry["FamilyName"]:
+            entries.append(entry)
+
+    info = {}
+    heading = [cell_text(row[0]) for row in rows[:header_row] if row and cell_text(row[0])]
+    if heading:
+        info["title"] = heading[0]
+    for line in heading[1:]:
+        match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", line)
+        if match:
+            day, month, year = (int(g) for g in match.groups())
+            try:
+                info["date"] = datetime(year, month, day).date()
+            except ValueError:
+                pass
+            break
+    log(f"Lest deltakere fra musikktjenesten: {excel_path} ({len(entries)} rader)")
+    return entries, info
+
+
+def participant_from_entry(entry):
+    row = new_participant(entry["GivenName"], entry["FamilyName"], entry["Organisation"],
+                          entry["Gender"], "Påmeldt")
+    for field in ("NifId", "Klasse", "Ovelse"):
+        row[field] = entry[field]
+    return row
 
 
 def generate_excel(rows, out_path, log):
@@ -494,21 +550,7 @@ def generate_excel(rows, out_path, log):
     ws = wb.active
     ws.title = "Participants"
 
-    headers = [
-        "PrintName",
-        "Organisation",
-        "ParticipantCode",
-        "Event",
-        "Påmelding",
-        "StartTid",
-        "SluttTid",
-        "Musikk",
-        "MusikkTid",
-        "Club1",
-        "Club2",
-        "ElementsFree",
-        "ElementsShort",
-    ]
+    headers = REPORT_HEADERS
     ws.append(headers)
     for row in rows:
         ws.append([row.get(h, "") for h in headers])
@@ -536,21 +578,7 @@ def generate_excel(rows, out_path, log):
 
 
 def generate_html(rows, out_path, title, log):
-    headers = [
-        "PrintName",
-        "Organisation",
-        "ParticipantCode",
-        "Event",
-        "Påmelding",
-        "StartTid",
-        "SluttTid",
-        "Musikk",
-        "MusikkTid",
-        "Club1",
-        "Club2",
-        "ElementsFree",
-        "ElementsShort",
-    ]
+    headers = REPORT_HEADERS
 
     def esc(s):
         return (
@@ -625,17 +653,7 @@ def generate_pdf(rows, out_path, title, log):
         log("Mangler reportlab. Installer med: pip install reportlab")
         return False
 
-    headers = [
-        "PrintName",
-        "Organisation",
-        "Event",
-        "Påmelding",
-        "StartTid",
-        "SluttTid",
-        "Musikk",
-        "MusikkTid",
-        "ElementsFree",
-    ]
+    headers = REPORT_HEADERS
     data = [headers]
     for row in rows:
         data.append([row.get(h, "") for h in headers])
@@ -791,7 +809,7 @@ def build_startliste(
             nr += 1
             # LopLengde (sekunder) overstyrer standard lengde på løp for én utøver.
             run = item.get("LopLengde") or run_seconds
-            add("run", run + ready_seconds, nr, display_name(item), item.get("Organisation", ""), item, run)
+            add("run", run + ready_seconds, nr, run_name(item), item.get("Organisation", ""), item, run)
     return entries
 
 
@@ -1035,13 +1053,18 @@ class App:
         self.drag_iid = None
         self.overflow_tips = {}
         self.tip = None
-        self.zip_path = None
         self.source_dir = None
+        # Deltakerlisten fra musikktjenesten (entries_*.xlsx), slik at rekkefølgen på innlesingen ikke betyr noe.
+        self.music_entries = []
         self.music_zip = None
         self.music_cache_dir = None
         self.music_file_info = {}
         self.music_files = []
         self.music_durations = {}
+        # {lydfil: {"name", "segment", "category"}} for filer med musikktjenestens filnavn.
+        self.music_index = {}
+        # {(navn, SP/FS): status} fra music-status.csv.
+        self.music_status = {}
         self.audio_backend = None
         self.audio_ready = False
         self.vlc_process = None
@@ -1217,9 +1240,10 @@ class App:
 
         menu_file = add_menu("Fil")
         menu_file.add_command(label="Hent deltakerliste fra isonen…", command=self.load_isonen)
+        menu_file.add_command(label="Hent deltakere fra musikktjenesten…", command=self.load_music_entries)
         menu_file.add_command(label="Velg musikk-zip…", command=self.choose_music_zip)
         menu_file.add_command(
-            label="Skann mappe (isonen, FMS-data og musikk)…", command=self.scan_folder
+            label="Skann mappe (isonen, musikktjenesten og musikk-zip)…", command=self.scan_folder
         )
         menu_file.add_separator()
         menu_file.add_command(label="Nytt oppsett", command=self.clear_rows)
@@ -1350,6 +1374,8 @@ class App:
         actions = ttk.Frame(form, style="Panel.TFrame")
         actions.grid(row=row + 5, column=0, columnspan=2, sticky="we", pady=(24, 0))
         ttk.Button(actions, text="Hent fra isonen…", command=self.load_isonen).pack(fill="x")
+        ttk.Button(actions, text="Hent fra musikktjenesten…", command=self.load_music_entries).pack(
+            fill="x", pady=(8, 0))
         ttk.Button(actions, text="Åpne oppsett…", command=self.open_setup).pack(fill="x", pady=(8, 0))
         ttk.Button(actions, text="Lagre oppsett", command=self.save_setup).pack(fill="x", pady=(8, 0))
         ttk.Button(actions, text="Lagre startliste (Excel + PDF)", style="Accent.TButton",
@@ -1465,14 +1491,18 @@ class App:
             "starttid": "Start",
             "navn": "Navn",
             "klubb": "Klubb",
+            "klasse": "Klasse",
+            "program": "Program",
             "påmelding": "Påmelding",
+            "musikkstatus": "Musikkstatus",
             "musikknavn": "Lydfil",
             "musikkformat": "Format",
             "musikktid": "Lengde",
         }
         self.tree = ttk.Treeview(table, columns=tuple(columns), show="headings", selectmode="browse")
         for col, text in columns.items():
-            anchor = "w" if col in ("navn", "klubb", "påmelding", "musikknavn") else "center"
+            left = ("navn", "klubb", "klasse", "påmelding", "musikkstatus", "musikknavn")
+            anchor = "w" if col in left else "center"
             self.tree.heading(col, text=text, anchor=anchor)
             self.tree.column(col, width=100, anchor=anchor)
         self.tree.tag_configure("missing_music", foreground=BAD)
@@ -1971,7 +2001,7 @@ class App:
         if not self.confirm_discard():
             return
         self.items = []
-        self.zip_path = None
+        self.music_entries = []
         self.setup_path = None
         self.log("Startet et nytt oppsett.")
         self.refresh_schedule()
@@ -2049,7 +2079,7 @@ class App:
         # Gamle oppsett mangler antall grupper; tidsplanen i filen bestemmer.
         self.sync_marker_counts()
         self.source_dir = Path(data["source_dir"]) if data.get("source_dir") else None
-        self.zip_path = None
+        self.music_entries = []
         music = data.get("music_zip")
         if music and Path(music).is_file():
             self.load_music_zip(music, match=False)
@@ -2076,22 +2106,85 @@ class App:
         if not rows:
             messagebox.showerror("Feil", "Fant ingen deltakere i excel-filen.")
             return
-        self.rows = rows
-        self.zip_path = None
+        self.use_participants(rows, Path(path).parent)
+
+    def load_music_entries(self):
+        initial = self.source_dir or (Path.home() / "Downloads")
+        path = filedialog.askopenfilename(
+            title="Velg deltakerliste fra musikktjenesten (entries_….xlsx)",
+            initialdir=str(initial),
+            filetypes=[("Excel", "*.xlsx"), ("Alle filer", "*.*")],
+        )
+        if not path:
+            return
+        entries, info = load_entries_from_excel(path, self.log)
+        if not entries:
+            messagebox.showerror("Feil", "Fant ingen deltakere i excel-filen fra musikktjenesten.")
+            return
+        self.music_entries = entries
+        self.apply_event_info(info)
+        if self.rows:
+            # Utfyller deltakerlisten som allerede er lastet (isonen eller oppsett).
+            self.apply_music_entries()
+            self.refresh_schedule()
+        elif self.confirm_replace():
+            self.use_participants([participant_from_entry(e) for e in entries], Path(path).parent)
+
+    def use_participants(self, rows, source_dir):
+        # Ny deltakerliste: deles i kortprogram/friløp og kobles mot musikktjenesten og musikk-zip.
+        self.rows = split_segments(rows)
         self.setup_path = None
-        self.source_dir = Path(path).parent
-        cancelled = len(rows) - len(self.active_rows())
+        self.source_dir = source_dir
+        cancelled = len(self.rows) - len(self.active_rows())
         if cancelled:
             self.log(f"{cancelled} avmeldte er tatt ut av tidsplanen.")
+        programs = sum(1 for r in self.rows if r.get("Program") == SEGMENT_NAMES["SP"])
+        if programs:
+            self.log(f"{programs} utøvere har kortprogram og friløp, og får ett løp for hvert program.")
+        if self.music_entries:
+            self.apply_music_entries()
         if self.music_files:
             self.match_all_music()
         self.relayout(auto_size=True)
         self.refresh_schedule()
 
+    def apply_event_info(self, info):
+        if info.get("title"):
+            self.event_name_var.set(info["title"])
+        if info.get("date"):
+            self.start_date_var.set(info["date"].strftime("%d.%m.%y"))
+        if info:
+            date = f" {info['date']:%d.%m.%Y}" if info.get("date") else ""
+            self.log(f"Stevne fra musikktjenesten: {info.get('title', '')}{date}")
+
+    def apply_music_entries(self):
+        # Kobler deltakerne fra musikktjenesten til radene med NIF ID (= Person ID i isonen), ellers navn.
+        by_nif, by_name = {}, {}
+        for row in self.rows:
+            if row.get("NifId"):
+                by_nif.setdefault(row["NifId"], []).append(row)
+            by_name.setdefault(full_name_key(row), []).append(row)
+        found = set()
+        for entry in self.music_entries:
+            rows = by_nif.get(entry["NifId"]) or by_name.get(full_name_key(entry), [])
+            if not rows:
+                self.log(f"I musikktjenesten, men ikke i deltakerlisten: "
+                         f"{entry['GivenName']} {entry['FamilyName']} ({entry['Klasse']})")
+                continue
+            for row in rows:
+                found.add(id(row))
+                for field in ("NifId", "Klasse", "Ovelse"):
+                    if not row.get(field):
+                        row[field] = entry[field]
+        missing = [r for r in self.active_rows() if id(r) not in found]
+        for row in missing:
+            self.log(f"Ikke påmeldt i musikktjenesten: {run_name(row)}")
+        self.log(f"Musikktjenesten: {len(found)} løp koblet, {len(missing)} mangler.")
+
     def choose_music_zip(self):
         initial = self.source_dir or (Path.home() / "Downloads")
         path = filedialog.askopenfilename(
-            title="Velg musikk-zip fra stevnedatabasen",
+            title="Velg musikk-zip fra musikktjenesten",
             initialdir=str(initial),
             filetypes=[("Zip", "*.zip"), ("Alle filer", "*.*")],
         )
@@ -2100,128 +2193,49 @@ class App:
 
     def scan_folder(self):
         path = filedialog.askdirectory(
-            title="Velg mappe med isonen-liste, FMS-data og musikk",
-            initialdir=str(self.source_dir or Path.home()),
+            title="Velg mappe med isonen-liste, deltakere fra musikktjenesten og musikk-zip",
+            initialdir=str(self.source_dir or (Path.home() / "Downloads")),
         )
         if path and self.confirm_replace():
-            self.read_zip(Path(path))
+            self.read_folder(Path(path))
 
-    def read_zip(self, folder):
+    @staticmethod
+    def newest_file(folder, *patterns):
+        files = {f for pattern in patterns for f in folder.glob(pattern) if f.is_file()}
+        return max(files, key=lambda f: f.stat().st_mtime) if files else None
+
+    def read_folder(self, folder):
+        # Bruker nyeste fil av hver type, siden nedlastingsmappen ofte har flere versjoner.
         self.log_widget.delete("1.0", "end")
-        excel_files = sorted(folder.glob("Deltakerliste*.xlsx"))
-        if not excel_files:
-            messagebox.showerror("Feil", "Fant ingen Deltakerliste*.xlsx i mappen.")
+        isonen = self.newest_file(folder, "Deltakerliste*.xlsx")
+        entries_path = self.newest_file(folder, "entries*.xlsx")
+        music_zip = self.newest_file(folder, "Music*.zip", "Musikk*.zip")
+        if not isonen and not entries_path:
+            messagebox.showerror(
+                "Feil",
+                "Fant verken Deltakerliste*.xlsx (isonen) eller entries*.xlsx (musikktjenesten) i mappen.",
+            )
             return
-        zips = sorted(folder.glob("*.zip"))
-        data_zips = [z for z in zips if z.name.lower().startswith(("fmsdata", "fsmdata"))]
-        music_zips = [z for z in zips if z.name.lower().startswith("musikk")]
-
-        if len(excel_files) > 1:
-            self.log(f"Fant flere deltakerlister. Bruker: {excel_files[0].name}")
-        rows = load_participants_from_excel(excel_files[0], self.log)
+        self.music_entries = []
+        if entries_path:
+            self.music_entries, info = load_entries_from_excel(entries_path, self.log)
+            self.apply_event_info(info)
+        else:
+            self.log("Fant ingen entries*.xlsx fra musikktjenesten.")
+        if isonen:
+            rows = load_participants_from_excel(isonen, self.log)
+        else:
+            self.log("Fant ingen Deltakerliste*.xlsx fra isonen. Bruker deltakerne fra musikktjenesten.")
+            rows = [participant_from_entry(e) for e in self.music_entries]
         if not rows:
             messagebox.showerror("Feil", "Fant ingen deltakere i excel-filen.")
             return
-        self.rows = rows
-        self.setup_path = None
-        self.source_dir = folder
-        self.zip_path = data_zips[0] if data_zips else None
-        if self.zip_path:
-            if len(data_zips) > 1:
-                self.log(f"Fant flere FMSData-zip. Bruker: {self.zip_path.name}")
-            self.match_fms_data(self.zip_path)
+        if music_zip:
+            self.load_music_zip(music_zip, match=False)
         else:
-            self.log("Fant ingen FMSData*.zip. Hopper over FMS-data.")
-        if music_zips:
-            if len(music_zips) > 1:
-                self.log(f"Fant flere musikk-zip. Bruker: {music_zips[0].name}")
-            self.load_music_zip(music_zips[0])
-        elif self.music_files:
-            self.match_all_music()
-        self.log(f"Totalt deltakere: {len(self.rows)}")
-        self.relayout(auto_size=True)
-        self.refresh_schedule()
-
-    def match_fms_data(self, zip_path):
-        self.log(f"Leser zip: {zip_path.name}")
-        zip_rows = []
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            xml_entries = [e for e in zf.infolist() if e.filename.lower().endswith(".xml")]
-            if not xml_entries:
-                self.log("Fant ingen xml-filer i FMS-zip.")
-                return
-            for entry in xml_entries:
-                self.log(f"Leser fil: {entry.filename}")
-                xml_text = decode_xml_bytes(zf.read(entry))
-                if "judges" in entry.filename.lower():
-                    parse_officials(xml_text, self.log)
-                else:
-                    zip_rows.extend(parse_competition(xml_text, self.log))
-
-        zip_people_strict = {}
-        zip_people_loose = {}
-        for row in zip_rows:
-            strict_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=True)
-            loose_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=False)
-            if strict_key[0] or strict_key[1]:
-                zip_people_strict.setdefault(strict_key, row)
-            if loose_key[0] or loose_key[1]:
-                zip_people_loose.setdefault(loose_key, []).append(strict_key)
-
-        used_zip_keys = set()
-        used_loose_keys = set()
-        fms_fields = ("ParticipantCode", "Event", "EntryOrder", "Music1", "Music2", "Club1", "Club2",
-                      "ElementsFree", "ElementsShort")
-        for row in self.rows:
-            strict_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=True)
-            loose_key = build_name_key(row.get("GivenName"), row.get("FamilyName"), strict=False)
-            zip_row = None
-            match_type = ""
-            if strict_key in zip_people_strict and strict_key not in used_zip_keys:
-                zip_row = zip_people_strict.get(strict_key)
-                used_zip_keys.add(strict_key)
-                match_type = "eksakt"
-            else:
-                for candidate_key in zip_people_loose.get(loose_key, []):
-                    if candidate_key in used_zip_keys:
-                        continue
-                    zip_row = zip_people_strict.get(candidate_key)
-                    if zip_row:
-                        used_zip_keys.add(candidate_key)
-                        match_type = "loose"
-                        break
-            if zip_row:
-                for field in fms_fields:
-                    row[field] = zip_row.get(field, "")
-                zip_print = zip_row.get("PrintName") or f"{zip_row.get('GivenName', '')} {zip_row.get('FamilyName', '')}".strip()
-                row["NavnFraFsm"] = zip_print
-                row["Manglende i zip"] = ""
-                if loose_key[0] or loose_key[1]:
-                    used_loose_keys.add(loose_key)
-                if match_type == "loose":
-                    self.log(f"Matcher (loose): {row.get('NavnFraIsonen', '')} -> {zip_print}")
-                else:
-                    self.log(f"Matcher: {row.get('NavnFraIsonen', '')} -> {zip_print}")
-            else:
-                row["Manglende i zip"] = "JA"
-                row["NavnFraFsm"] = ""
-                self.log(f"Mangler i FSM: {row.get('NavnFraIsonen', '')}")
-
-        for key, zip_row in zip_people_strict.items():
-            if key in used_zip_keys:
-                continue
-            loose_key = build_name_key(zip_row.get("GivenName"), zip_row.get("FamilyName"), strict=False)
-            if loose_key in used_loose_keys:
-                continue
-            row = new_participant(zip_row.get("GivenName"), zip_row.get("FamilyName"),
-                                  zip_row.get("Organisation"), zip_row.get("Gender"))
-            for field in fms_fields:
-                row[field] = zip_row.get(field, "")
-            row["NavnFraIsonen"] = ""
-            row["NavnFraFsm"] = zip_row.get("PrintName") or display_name(row)
-            row["PrintName"] = row["NavnFraFsm"]
-            self.log(f"Ekstra i FSM (ny rad): {row['NavnFraFsm']}")
-            self.items.append(row)
+            self.log("Fant ingen Music*.zip eller Musikk*.zip i mappen.")
+        self.use_participants(rows, folder)
+        self.log(f"Totalt {len(self.active_rows())} løp.")
 
     def load_music_zip(self, music_zip, match=True):
         self.music_zip = Path(music_zip)
@@ -2229,17 +2243,26 @@ class App:
         self.music_file_info = {}
         self.music_files = []
         self.music_durations = {}
+        self.music_index = {}
+        self.music_status = {}
         self.log(f"Leser musikk-zip: {self.music_zip.name}")
         try:
             with zipfile.ZipFile(self.music_zip, "r") as mz:
                 for entry in mz.infolist():
+                    if entry.is_dir():
+                        continue
+                    if PurePosixPath(entry.filename).name.lower() == "music-status.csv":
+                        text = mz.read(entry).decode("utf-8-sig", errors="replace")
+                        self.music_status = parse_music_status_csv(text)
+                        continue
                     declared_suffix = Path(entry.filename).suffix.lower()
-                    if entry.is_dir() or declared_suffix not in {".mp3", ".wav", ".m4a", ".mp4", ".aac"}:
+                    if declared_suffix not in AUDIO_SUFFIXES:
                         continue
                     data = mz.read(entry)
                     audio_format, detected_suffix = detect_audio_format(data)
                     format_mismatch = bool(detected_suffix and declared_suffix != detected_suffix)
                     self.music_files.append(entry.filename)
+                    self.music_index[entry.filename] = parse_music_path(entry.filename)
                     self.music_durations[entry.filename] = get_audio_duration(data, audio_format)
                     self.music_file_info[entry.filename] = {
                         "format": audio_format,
@@ -2267,17 +2290,30 @@ class App:
             f"Lydkontroll: {len(self.music_files)} filer, {warnings} med feil filendelse, "
             f"{errors} med ukjent format."
         )
+        if self.music_status:
+            self.log(f"Leste music-status.csv: {len(self.music_status)} program.")
+        elif any(self.music_index.values()):
+            self.log("Fant ikke music-status.csv i musikk-zip.")
         self.music_info_var.set(f"{self.music_zip.name} · {len(self.music_files)} lydfiler")
         if match:
             self.match_all_music()
         return True
 
+    def find_music_file(self, row, used_files):
+        if not self.music_files:
+            return ""
+        if any(self.music_index.values()):
+            return find_music_for_row(row, self.music_index, used_files)
+        # Eldre musikk-zip uten musikktjenestens filnavn: leter etter navnet i filnavnet.
+        return self.match_music_file(row, self.music_files, used_files)
+
     def apply_music_match(self, row, used_files):
-        matched = self.match_music_file(row, self.music_files, used_files) if self.music_files else ""
+        matched = self.find_music_file(row, used_files)
         info = self.music_file_info.get(matched, {}) if matched else {}
         seconds = self.music_durations.get(matched) if matched else None
         row["Musikk"] = "ok" if matched else "mangler"
         row["MusikkFil"] = matched
+        row["MusikkStatus"] = music_status_text(row, matched, self.music_status) if self.music_files else ""
         row["MusikkFormat"] = info.get("format", "")
         row["MusikkFormatAvvik"] = info.get("format_mismatch", False)
         row["MusikkSpillbar"] = info.get("playable", bool(matched))
@@ -2292,9 +2328,14 @@ class App:
         used = set()
         for row in self.rows:
             self.apply_music_match(row, used)
-        missing = sum(1 for r in self.active_rows() if not r.get("MusikkFil"))
-        if missing:
-            self.log(f"{missing} utøvere mangler lydfil.")
+        active = self.active_rows()
+        missing = [r for r in active if not r.get("MusikkFil")]
+        for row in missing:
+            self.log(f"Mangler musikk: {run_name(row)} ({row.get('MusikkStatus')})")
+        for filename in self.music_files:
+            if filename not in used:
+                self.log(f"Lydfil uten utøver: {filename}")
+        self.log(f"Musikk: {len(active) - len(missing)} av {len(active)} løp har lydfil.")
 
     def match_missing_music(self):
         if not self.music_files:
@@ -2369,8 +2410,11 @@ class App:
                 row.get("StartTid", ""),
                 display_name(row),
                 row.get("Organisation", ""),
+                row.get("Klasse", ""),
+                SEGMENT_NAMES.get(row.get("Segment") or "FS", ""),
                 row.get("Påmelding", ""),
-                "mangler musikk" if missing else row.get("MusikkFil", ""),
+                (row.get("MusikkStatus") or "Mangler musikk") if missing else row.get("MusikkStatus", ""),
+                PurePosixPath(row.get("MusikkFil") or "").name,
                 row.get("MusikkFormat", ""),
                 row.get("MusikkTid", ""),
             )
@@ -2453,9 +2497,10 @@ class App:
         name = (
             row.get("NavnFraIsonen")
             or row.get("PrintName")
-            or row.get("NavnFraFsm")
             or "denne deltakeren"
         )
+        if row.get("Program"):
+            name = f"{name} ({row['Program'].lower()})"
         if completed:
             question = f"Vil du fjerne markeringen som gjennomført for {name}?"
         else:
@@ -2824,7 +2869,7 @@ class App:
             messagebox.showerror("Feil", "Ingen data lastet.")
             return
         out_dir = self.output_dir()
-        base_name = self.zip_path.stem if self.zip_path else "Deltakerliste"
+        base_name = "Deltakerliste"
         if self.var_excel.get():
             generate_excel(self.rows, str(out_dir / f"{base_name}.xlsx"), self.log)
         if self.var_html.get():
@@ -2950,7 +2995,7 @@ class App:
             frame,
             text=(
                 "Setter opp tidsplan for stevnet og spiller av musikken underveis. "
-                "Leser deltakerlister fra isonen, eller lister du lager selv."
+                "Leser deltakerlister fra isonen og musikktjenesten, eller lister du lager selv."
             ),
             wraplength=360,
             justify="center",
