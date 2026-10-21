@@ -11,15 +11,22 @@ from datetime import datetime
 
 from kunstlopassistenten import (
     App,
+    add_missing_segments,
     auto_group_size,
     build_startliste,
     detect_audio_format,
+    find_music_for_row,
     generate_startliste_excel,
+    generate_vlc_playlist,
     get_audio_duration,
     group_overflows,
     layout_items,
     new_participant,
+    parse_duration_mmss,
+    parse_music_path,
     place_water_pauses,
+    split_segments,
+    validate_setup,
     water_pause_positions,
 )
 
@@ -345,6 +352,122 @@ class TableInteractionTests(unittest.TestCase):
         self.assertTrue(app.rows[0]["LopGjennomfort"])
         askyesno.assert_called_once()
         app.refresh_table.assert_not_called()
+
+
+class RegressionTests(unittest.TestCase):
+    def runner(self, given, family="Test", **fields):
+        row = new_participant(given, family)
+        row.update(fields)
+        return row
+
+    def test_rejects_negative_and_invalid_durations(self):
+        self.assertEqual(parse_duration_mmss("3:10"), 190)
+        self.assertEqual(parse_duration_mmss("1:02:03"), 3723)
+        for value in ("-1:00", "1:-05", "3:75", "1:60:00", "abc", "1"):
+            self.assertIsNone(parse_duration_mmss(value), value)
+
+    def test_stale_selection_after_list_is_replaced(self):
+        app = App.__new__(App)
+        app.schedule_tree = SimpleNamespace(selection=lambda: ("i5",))
+        app.items = [self.runner("A")]
+
+        self.assertIsNone(app.selected_item())
+
+    def test_ambiguous_music_match_is_marked_uncertain(self):
+        index = {f: parse_music_path(f) for f in (
+            "Stevne/Junior_Jenter/FS/Anna_Berg_FS.mp3",
+            "Stevne/Senior_Damer/FS/Anna_Berg_FS.mp3",
+        )}
+        row = self.runner("Anna", "Berg", Segment="FS", Klasse="Ukjent klasse")
+
+        matched, uncertain = find_music_for_row(row, index, set())
+
+        self.assertTrue(matched)
+        self.assertTrue(uncertain)
+
+    def test_music_match_uses_class_and_is_certain(self):
+        index = {f: parse_music_path(f) for f in (
+            "Stevne/Junior_Jenter/FS/Anna_Berg_FS.mp3",
+            "Stevne/Senior_Damer/FS/Anna_Berg_FS.mp3",
+        )}
+        row = self.runner("Anna", "Berg", Segment="FS", Klasse="Senior")
+
+        self.assertEqual(find_music_for_row(row, index, set()),
+                         ("Stevne/Senior_Damer/FS/Anna_Berg_FS.mp3", False))
+
+    def test_exact_names_are_matched_before_fuzzy_names(self):
+        app = App.__new__(App)
+        app.music_files = ["S/Klasse/FS/Anna_Berg_Hansen_FS.mp3"]
+        app.music_index = {f: parse_music_path(f) for f in app.music_files}
+        app.music_file_info, app.music_durations, app.music_status = {}, {}, {}
+        fuzzy_row = self.runner("Anna", "Berg", Segment="FS")
+        exact_row = self.runner("Anna", "Berg Hansen", Segment="FS")
+
+        app.match_rows([fuzzy_row, exact_row], set())
+
+        self.assertEqual(exact_row["MusikkFil"], app.music_files[0])
+        self.assertEqual(fuzzy_row["MusikkFil"], "")
+
+    def test_late_short_program_info_adds_free_skate(self):
+        row = self.runner("Anna")
+        items = [{"Kind": "warmup"}] + split_segments([row])
+        row["Ovelse"] = "Kortprogram+Friløp"
+
+        self.assertEqual(add_missing_segments(items), 1)
+        self.assertEqual([(i.get("Segment"), i.get("Program")) for i in items[1:]],
+                         [("SP", "Kortprogram"), ("FS", "Friløp")])
+        self.assertEqual(add_missing_segments(items), 0)
+
+    def test_sorting_keeps_cancelled_runners_out_of_active_slots(self):
+        app = App.__new__(App)
+        app.refresh_schedule = Mock()
+        rows = [self.runner("C"), self.runner("A"), self.runner("B", Påmelding="Avmeldt")]
+        app.items = layout_items(rows, 1, 8, 0)
+
+        app.sort_by_given()
+
+        self.assertEqual([r["GivenName"] for r in app.rows], ["A", "C", "B"])
+
+    def test_validates_setup_before_loading(self):
+        valid = {"type": "kunstlopassistenten-oppsett", "version": 1, "settings": {"start": "18:00"},
+                 "items": [{"Kind": "warmup"}, self.runner("A", LopLengde=150)]}
+        self.assertIsNone(validate_setup(valid))
+        for broken in (
+            dict(valid, type="noe annet"),
+            dict(valid, version=2),
+            dict(valid, settings=["feil"]),
+            dict(valid, items=["ikke en rad"]),
+            dict(valid, items=[self.runner("A", LopLengde="3:00")]),
+            dict(valid, items=[self.runner("A", LopLengde=-60)]),
+            dict(valid, items=[self.runner("A", Påmelding=5)]),
+        ):
+            self.assertIsNotNone(validate_setup(broken), broken)
+
+    def test_playlist_uses_updated_music_from_zip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            music_zip = Path(temp_dir) / "Musikk.zip"
+            out_dir = Path(temp_dir) / "out"
+            rows = [{"MusikkFil": "mappe/sang.mp3", "PrintName": "Test"}]
+            for data in (b"ID3-gammel", b"ID3-ny"):
+                with zipfile.ZipFile(music_zip, "w") as archive:
+                    archive.writestr("mappe/sang.mp3", data)
+                self.assertTrue(generate_vlc_playlist(rows, out_dir, "x", music_zip, Mock()))
+
+            self.assertEqual((out_dir / "music" / "mappe" / "sang.mp3").read_bytes(), b"ID3-ny")
+
+    def test_new_playback_stops_running_vlc(self):
+        app = App.__new__(App)
+        old_process = Mock()
+        old_process.poll.return_value = None
+        app.vlc_process = old_process
+        app.audio_ready = False
+        app.external_playback = True
+
+        app.stop_running_playback()
+
+        old_process.terminate.assert_called_once()
+        self.assertIsNone(app.vlc_process)
+        self.assertFalse(app.external_playback)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import json
 import shutil
 import wave
 from tkinter import font as tkfont
+from xml.sax.saxutils import escape as xml_escape
 
 APP_NAME = "Kunstløpassistenten"
 
@@ -119,6 +120,22 @@ def split_segments(rows):
     return out + free_skates
 
 
+def add_missing_segments(items):
+    # Utøvere som får «Kortprogram+Friløp» etter at listen er delt opp (f.eks. ved senere import
+    # fra musikktjenesten): kortprogrammet tar plassen, friløpsraden flyttes bakerst.
+    moved = []
+    for k, item in enumerate(items):
+        if is_marker(item) or item.get("Program") or len(segments_for(item.get("Ovelse"))) < 2:
+            continue
+        items[k] = dict(item, Segment="SP", Program=SEGMENT_NAMES["SP"], MusikkFil="", Musikk="",
+                        MusikkStatus="", MusikkTid="", MusikkSek="", LopGjennomfort=False)
+        items[k].pop("LopLengde", None)
+        item["Segment"], item["Program"] = "FS", SEGMENT_NAMES["FS"]
+        moved.append(item)
+    items.extend(moved)
+    return len(moved)
+
+
 def parse_music_path(filename):
     # Musikktjenesten: <stevne>/<Klasse_Kjønn>/<SP|FS>/<Fornavn_Etternavn>_<SP|FS>.mp3
     path = PurePosixPath(filename)
@@ -142,29 +159,31 @@ def parse_music_status_csv(text):
     return status
 
 
-def find_music_for_row(row, music_index, used_files):
+def find_music_for_row(row, music_index, used_files, fuzzy=True):
     # Finner lydfilen for utøverens program (SP/FS) i en strukturert musikk-zip.
-    # Først eksakt navn, så fornavn + alle etternavn. Ved like navn vinner riktig klasse.
+    # Først eksakt navn, så (fuzzy) fornavn + alle etternavn. Ved like navn vinner riktig klasse.
+    # Returnerer (fil, usikker); usikker betyr at flere filer passer og koblingen bør sjekkes.
     segment = row.get("Segment") or "FS"
-    candidates = [f for f, info in music_index.items()
-                  if info and info["segment"] == segment and f not in used_files]
+    files = [f for f, info in music_index.items() if info and info["segment"] == segment]
     name = full_name_key(row)
-    hits = [f for f in candidates if music_index[f]["name"] == name]
-    if not hits:
+    hits = [f for f in files if music_index[f]["name"] == name]
+    if not hits and fuzzy:
         tokens = tokenize_name(row.get("GivenName"))[:1] + tokenize_name(row.get("FamilyName"))
         if len(tokens) > 1:
-            hits = [f for f in candidates if set(tokens) <= set(music_index[f]["name"].split())]
-    if not hits:
-        return ""
+            hits = [f for f in files if set(tokens) <= set(music_index[f]["name"].split())]
     klasse = normalize_text(row.get("Klasse"))
-    best = next((f for f in hits if klasse and music_index[f]["category"].startswith(klasse)), hits[0])
-    used_files.add(best)
-    return best
+    in_class = [f for f in hits if klasse and music_index[f]["category"].startswith(klasse)]
+    pool = in_class if any(f not in used_files for f in in_class) else hits
+    free = [f for f in pool if f not in used_files]
+    if not free:
+        return "", False
+    used_files.add(free[0])
+    return free[0], len(pool) > 1
 
 
-def music_status_text(row, matched, status_map):
+def music_status_text(row, matched, status_map, uncertain=False):
     if matched:
-        return "OK"
+        return "Usikker kobling – sjekk lydfil" if uncertain else "OK"
     status = status_map.get((full_name_key(row), row.get("Segment") or "FS"))
     if status is None:
         return "Ikke i musikktjenesten" if status_map else "Mangler musikk"
@@ -298,14 +317,17 @@ def parse_duration_mmss(value):
     parts = [p.strip() for p in value.split(":")]
     try:
         if len(parts) == 2:
-            m, s = int(parts[0]), int(parts[1])
-            return m * 60 + s
-        if len(parts) == 3:
+            h, m, s = 0, int(parts[0]), int(parts[1])
+        elif len(parts) == 3:
             h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
-            return h * 3600 + m * 60 + s
+        else:
+            return None
     except ValueError:
         return None
-    return None
+    # Negative tider og sekunder (eller minutter i T:MM:SS) over 59 avvises.
+    if min(h, m, s) < 0 or s > 59 or (len(parts) == 3 and m > 59):
+        return None
+    return h * 3600 + m * 60 + s
 
 
 def parse_date_ddmmyy(value):
@@ -398,6 +420,33 @@ def cell_text(value):
     if isinstance(value, float) and value.is_integer():
         value = int(value)
     return str(value).strip()
+
+
+SETUP_TEXT_FIELDS = ("PrintName", "NavnFraIsonen", "GivenName", "FamilyName", "Organisation", "Påmelding",
+                     "Klasse", "Ovelse", "Segment", "Program", "MusikkFil")
+
+
+def validate_setup(data):
+    # Sjekker hele oppsettfilen før noe tas i bruk. Returnerer feilmelding, eller None når den er gyldig.
+    if data.get("type") not in (None, "kunstlopassistenten-oppsett"):
+        return "Filen er ikke et oppsett fra Kunstløpassistenten."
+    if safe_int(data.get("version"), 1) > 1:
+        return "Oppsettet er laget med en nyere versjon av Kunstløpassistenten."
+    settings = data.get("settings") or {}
+    if not isinstance(settings, dict) or not all(isinstance(v, str) for v in settings.values()):
+        return "Innstillingene i oppsettet er ugyldige."
+    for nr, item in enumerate(data["items"], start=1):
+        if not isinstance(item, dict):
+            return f"Rad {nr} i oppsettet er ugyldig."
+        if item.get("Kind") not in (None, "warmup", "pause"):
+            return f"Rad {nr} har ukjent type: {item.get('Kind')}"
+        for field in SETUP_TEXT_FIELDS:
+            if item.get(field) is not None and not isinstance(item[field], str):
+                return f"Rad {nr} har ugyldig verdi i feltet {field}."
+        length = item.get("LopLengde")
+        if length not in (None, "") and (isinstance(length, bool) or not isinstance(length, int) or length <= 0):
+            return f"Rad {nr} ({display_name(item)}) har ugyldig lengde på løp: {length}"
+    return None
 
 
 def load_participants_from_excel(excel_path, log):
@@ -674,7 +723,7 @@ def generate_pdf(rows, out_path, title, log):
             story.append(Spacer(1, 6))
         except Exception:
             log("Klarte ikke å lese logo-bildet.")
-    story.append(Paragraph(title, styles["Heading2"]))
+    story.append(Paragraph(xml_escape(title), styles["Heading2"]))
     story.append(Spacer(1, 12))
 
     table = Table(data, repeatRows=1)
@@ -909,8 +958,9 @@ def generate_startliste_pdf(entries, out_path, title, log):
     data = [["Nr.", "Start", "", "Slutt", Paragraph("Lengde på løp", head_style),
              Paragraph("Sammenlagt tidsforbruk", head_style), "Navn", "Klubb"]]
     for entry in entries:
-        name_cell = Paragraph(entry["navn"], body_style)
-        club_cell = Paragraph(entry["klubb"], body_style)
+        # Paragraph tolker tekst som markup, så & og < i navn må escapes.
+        name_cell = Paragraph(xml_escape(entry["navn"]), body_style)
+        club_cell = Paragraph(xml_escape(entry["klubb"]), body_style)
         data.append([entry["nr"], entry["start"], "-", entry["end"], entry["run_length"], entry["duration"],
                      name_cell, club_cell])
 
@@ -924,7 +974,7 @@ def generate_startliste_pdf(entries, out_path, title, log):
         leading=18,
     )
     generated_ts = format_generated_ts()
-    story = [Paragraph(title, title_style), Spacer(1, 8)]
+    story = [Paragraph(xml_escape(title), title_style), Spacer(1, 8)]
 
     col_widths = [26, 52, 10, 52, 54, 74, 145, 110]
     table = Table(data, repeatRows=1, colWidths=col_widths)
@@ -988,11 +1038,14 @@ def generate_vlc_playlist(rows, out_dir, base_name, music_zip, log):
                     continue
                 dest_path = music_out / fname
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-                if not dest_path.exists():
-                    try:
-                        mz.extract(fname, music_out)
-                    except Exception:
+                # Pakkes alltid ut på nytt, så en oppdatert zip med samme filnavn ikke gir gammel lyd.
+                try:
+                    mz.extract(fname, music_out)
+                except Exception as exc:
+                    if not dest_path.exists():
+                        log(f"Kunne ikke pakke ut {fname}: {exc}")
                         continue
+                    log(f"ADVARSEL: Kunne ikke oppdatere {fname} ({exc}). Bruker filen som ligger der fra før.")
                 duration = row.get("MusikkSek", "")
                 performer = row.get("PrintName", "")
                 song = Path(fname).stem
@@ -1004,7 +1057,11 @@ def generate_vlc_playlist(rows, out_dir, base_name, music_zip, log):
         log(f"Kunne ikke lage spilleliste: {exc}")
         return False
 
-    playlist_path.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        playlist_path.write_text("\n".join(lines), encoding="utf-8")
+    except Exception as exc:
+        log(f"Kunne ikke skrive spilleliste: {playlist_path} ({exc})")
+        return False
     log(f"Spilleliste skrevet: {playlist_path}")
     return True
 
@@ -1714,7 +1771,9 @@ class App:
         selected = self.schedule_tree.selection()
         if not selected:
             return None
-        return self.items[int(selected[0][1:])]
+        # Valget kan være igjen fra før listen ble byttet ut eller kortet ned.
+        index = int(selected[0][1:])
+        return self.items[index] if index < len(self.items) else None
 
     def refresh_schedule(self, select=None):
         if not hasattr(self, "schedule_tree"):
@@ -1974,25 +2033,28 @@ class App:
         self.refresh_schedule(select=remaining[min(pos, len(remaining) - 1)] if remaining else None)
 
     def set_runner_order(self, runners):
-        # Bytter rekkefølgen på utøverne, men lar grupper og pauser stå på sine plasser.
-        slots = [k for k, item in enumerate(self.items) if not is_marker(item)]
+        # Bytter rekkefølgen på aktive utøvere; grupper, pauser og avmeldte står på sine plasser.
+        slots = [k for k, item in enumerate(self.items)
+                 if not is_marker(item) and not is_cancelled(item.get("Påmelding", ""))]
         for slot, row in zip(slots, runners):
             self.items[slot] = row
         self.refresh_schedule()
 
     def shuffle_rows(self):
-        runners = self.rows
+        runners = self.active_rows()
         random.shuffle(runners)
         self.set_runner_order(runners)
 
     def sort_by_given(self):
         self.set_runner_order(sorted(
-            self.rows, key=lambda r: (normalize_text(r.get("GivenName")), normalize_text(r.get("FamilyName")))
+            self.active_rows(),
+            key=lambda r: (normalize_text(r.get("GivenName")), normalize_text(r.get("FamilyName"))),
         ))
 
     def sort_by_family(self):
         self.set_runner_order(sorted(
-            self.rows, key=lambda r: (normalize_text(r.get("FamilyName")), normalize_text(r.get("GivenName")))
+            self.active_rows(),
+            key=lambda r: (normalize_text(r.get("FamilyName")), normalize_text(r.get("GivenName"))),
         ))
 
     def clear_rows(self):
@@ -2000,6 +2062,7 @@ class App:
             return
         self.items = []
         self.music_entries = []
+        self.reset_music()
         self.setup_path = None
         self.log("Startet et nytt oppsett.")
         self.refresh_schedule()
@@ -2032,9 +2095,16 @@ class App:
             "music_zip": str(self.music_zip) if self.music_zip else "",
             "items": self.items,
         }
+        # Skriver til en midlertidig fil først, så forrige oppsett ikke ødelegges hvis skrivingen feiler.
+        tmp_path = path.with_name(path.name + ".tmp")
         try:
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp_path, path)
         except Exception as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             messagebox.showerror("Feil", f"Kunne ikke lagre oppsettet:\n{exc}")
             return False
         self.setup_path = path
@@ -2065,6 +2135,10 @@ class App:
             else:
                 messagebox.showerror("Feil", "Filen er ikke et oppsett fra Kunstløpassistenten.")
             return
+        error = validate_setup(data)
+        if error:
+            messagebox.showerror("Feil", f"Kunne ikke åpne oppsettet:\n{error}")
+            return
 
         self._loading = True
         try:
@@ -2073,11 +2147,13 @@ class App:
                     self.setup_vars[key].set(value)
         finally:
             self._loading = False
-        self.items = [item for item in data["items"] if isinstance(item, dict)]
+        self.items = list(data["items"])
         # Gamle oppsett mangler antall grupper; tidsplanen i filen bestemmer.
         self.sync_marker_counts()
         self.source_dir = Path(data["source_dir"]) if data.get("source_dir") else None
         self.music_entries = []
+        # Musikk fra forrige oppsett skal aldri henge igjen.
+        self.reset_music()
         music = data.get("music_zip")
         if music and Path(music).is_file():
             self.load_music_zip(music, match=False)
@@ -2124,13 +2200,22 @@ class App:
         if self.rows:
             # Utfyller deltakerlisten som allerede er lastet (isonen eller oppsett).
             self.apply_music_entries()
+            added = add_missing_segments(self.items)
+            if added:
+                self.log(f"{added} utøvere har også kortprogram. Friløpene er lagt bakerst i tidsplanen.")
+            if self.music_files:
+                self.match_all_music()
             self.refresh_schedule()
         elif self.confirm_replace():
             self.use_participants([participant_from_entry(e) for e in entries], Path(path).parent)
 
     def use_participants(self, rows, source_dir):
-        # Ny deltakerliste: deles i kortprogram/friløp og kobles mot musikktjenesten og musikk-zip.
-        self.rows = split_segments(rows)
+        # Ny deltakerliste: kobles mot musikktjenesten, deles i kortprogram/friløp og kobles mot musikk-zip.
+        # Musikktjenesten flettes inn først, siden den kan ha øvelsen som mangler i isonen.
+        self.rows = rows
+        if self.music_entries:
+            self.apply_music_entries()
+        self.rows = split_segments(self.rows)
         self.setup_path = None
         self.source_dir = source_dir
         cancelled = len(self.rows) - len(self.active_rows())
@@ -2139,8 +2224,6 @@ class App:
         programs = sum(1 for r in self.rows if r.get("Program") == SEGMENT_NAMES["SP"])
         if programs:
             self.log(f"{programs} utøvere har kortprogram og friløp, og får ett løp for hvert program.")
-        if self.music_entries:
-            self.apply_music_entries()
         if self.music_files:
             self.match_all_music()
         self.relayout(auto_size=True)
@@ -2228,6 +2311,7 @@ class App:
         if not rows:
             messagebox.showerror("Feil", "Fant ingen deltakere i excel-filen.")
             return
+        self.reset_music()
         if music_zip:
             self.load_music_zip(music_zip, match=False)
         else:
@@ -2235,23 +2319,29 @@ class App:
         self.use_participants(rows, folder)
         self.log(f"Totalt {len(self.active_rows())} løp.")
 
-    def load_music_zip(self, music_zip, match=True):
-        self.music_zip = Path(music_zip)
+    def reset_music(self):
+        self.music_zip = None
         self.music_cache_dir = None
         self.music_file_info = {}
         self.music_files = []
         self.music_durations = {}
         self.music_index = {}
         self.music_status = {}
-        self.log(f"Leser musikk-zip: {self.music_zip.name}")
+        self.music_info_var.set("Ingen musikk-zip valgt.")
+
+    def load_music_zip(self, music_zip, match=True):
+        # Leses inn i egne variabler og erstatter forrige musikk først når hele zip-en er lest.
+        music_zip = Path(music_zip)
+        files, index, durations, file_info, status = [], {}, {}, {}, {}
+        self.log(f"Leser musikk-zip: {music_zip.name}")
         try:
-            with zipfile.ZipFile(self.music_zip, "r") as mz:
+            with zipfile.ZipFile(music_zip, "r") as mz:
                 for entry in mz.infolist():
                     if entry.is_dir():
                         continue
                     if PurePosixPath(entry.filename).name.lower() == "music-status.csv":
                         text = mz.read(entry).decode("utf-8-sig", errors="replace")
-                        self.music_status = parse_music_status_csv(text)
+                        status = parse_music_status_csv(text)
                         continue
                     declared_suffix = Path(entry.filename).suffix.lower()
                     if declared_suffix not in AUDIO_SUFFIXES:
@@ -2259,10 +2349,10 @@ class App:
                     data = mz.read(entry)
                     audio_format, detected_suffix = detect_audio_format(data)
                     format_mismatch = bool(detected_suffix and declared_suffix != detected_suffix)
-                    self.music_files.append(entry.filename)
-                    self.music_index[entry.filename] = parse_music_path(entry.filename)
-                    self.music_durations[entry.filename] = get_audio_duration(data, audio_format)
-                    self.music_file_info[entry.filename] = {
+                    files.append(entry.filename)
+                    index[entry.filename] = parse_music_path(entry.filename)
+                    durations[entry.filename] = get_audio_duration(data, audio_format)
+                    file_info[entry.filename] = {
                         "format": audio_format,
                         "suffix": detected_suffix or declared_suffix,
                         "declared_suffix": declared_suffix,
@@ -2277,11 +2367,13 @@ class App:
                             f"{declared_suffix}, men er egentlig {audio_format}."
                         )
         except Exception as exc:
-            self.log(f"Kunne ikke lese musikk-zip: {self.music_zip} ({exc})")
+            self.log(f"Kunne ikke lese musikk-zip: {music_zip} ({exc})")
             messagebox.showerror("Feil", f"Kunne ikke lese musikk-zip:\n{exc}")
-            self.music_zip = None
-            self.music_info_var.set("Ingen musikk-zip valgt.")
             return False
+        self.reset_music()
+        self.music_zip = music_zip
+        self.music_files, self.music_index, self.music_durations = files, index, durations
+        self.music_file_info, self.music_status = file_info, status
         warnings = sum(1 for info in self.music_file_info.values() if info.get("format_mismatch"))
         errors = sum(1 for info in self.music_file_info.values() if not info.get("playable"))
         self.log(
@@ -2297,21 +2389,24 @@ class App:
             self.match_all_music()
         return True
 
-    def find_music_file(self, row, used_files):
+    def find_music_file(self, row, used_files, fuzzy=True):
+        # Returnerer (fil, usikker).
         if not self.music_files:
-            return ""
+            return "", False
         if any(self.music_index.values()):
-            return find_music_for_row(row, self.music_index, used_files)
+            return find_music_for_row(row, self.music_index, used_files, fuzzy)
         # Eldre musikk-zip uten musikktjenestens filnavn: leter etter navnet i filnavnet.
-        return self.match_music_file(row, self.music_files, used_files)
+        return self.match_music_file(row, self.music_files, used_files, fuzzy)
 
-    def apply_music_match(self, row, used_files):
-        matched = self.find_music_file(row, used_files)
+    def apply_music_match(self, row, used_files, fuzzy=True):
+        matched, uncertain = self.find_music_file(row, used_files, fuzzy)
         info = self.music_file_info.get(matched, {}) if matched else {}
         seconds = self.music_durations.get(matched) if matched else None
         row["Musikk"] = "ok" if matched else "mangler"
         row["MusikkFil"] = matched
-        row["MusikkStatus"] = music_status_text(row, matched, self.music_status) if self.music_files else ""
+        row["MusikkUsikker"] = uncertain
+        row["MusikkStatus"] = (music_status_text(row, matched, self.music_status, uncertain)
+                               if self.music_files else "")
         row["MusikkFormat"] = info.get("format", "")
         row["MusikkFormatAvvik"] = info.get("format_mismatch", False)
         row["MusikkSpillbar"] = info.get("playable", bool(matched))
@@ -2322,34 +2417,43 @@ class App:
             row["MusikkTid"] = format_duration(seconds)
             row["MusikkSek"] = int(round(seconds)) if seconds else ""
 
+    def match_rows(self, rows, used):
+        # Eksakte navn kobles for alle først, så løsere treff ikke tar filen fra en med eksakt navn.
+        for row in rows:
+            self.apply_music_match(row, used, fuzzy=False)
+        for row in rows:
+            if not row.get("MusikkFil"):
+                self.apply_music_match(row, used)
+
     def match_all_music(self):
         used = set()
-        for row in self.rows:
-            self.apply_music_match(row, used)
+        self.match_rows(self.rows, used)
         active = self.active_rows()
         missing = [r for r in active if not r.get("MusikkFil")]
         for row in missing:
             self.log(f"Mangler musikk: {run_name(row)} ({row.get('MusikkStatus')})")
+        uncertain = [r for r in active if r.get("MusikkUsikker")]
+        for row in uncertain:
+            self.log(f"ADVARSEL: Usikker musikkobling, sjekk lydfilen: {run_name(row)} → {row.get('MusikkFil')}")
         for filename in self.music_files:
             if filename not in used:
                 self.log(f"Lydfil uten utøver: {filename}")
-        self.log(f"Musikk: {len(active) - len(missing)} av {len(active)} løp har lydfil.")
+        self.log(f"Musikk: {len(active) - len(missing)} av {len(active)} løp har lydfil"
+                 f"{f', {len(uncertain)} usikre' if uncertain else ''}.")
 
     def match_missing_music(self):
         if not self.music_files:
             return
         used = {r.get("MusikkFil") for r in self.rows if r.get("MusikkFil")}
-        for row in self.rows:
-            if not row.get("MusikkFil"):
-                self.apply_music_match(row, used)
+        self.match_rows([r for r in self.rows if not r.get("MusikkFil")], used)
 
-    def match_music_file(self, row, music_files, used_files):
+    def match_music_file(self, row, music_files, used_files, fuzzy=True):
         given = row.get("GivenName")
         family = row.get("FamilyName")
         given_tokens = tokenize_name(given)
         family_tokens = tokenize_name(family)
         if not family_tokens:
-            return ""
+            return "", False
 
         def family_match(fname):
             hay = normalize_text(fname)
@@ -2361,23 +2465,21 @@ class App:
             hay = normalize_text(fname)
             return given_tokens[0] in hay
 
-        # Pass 1: require both family + given (if given exists), prefer unused.
+        # Pass 1: require both family + given (if given exists). Flere treff = usikker kobling.
         if given_tokens:
-            for fname in music_files:
-                if fname in used_files:
-                    continue
-                if family_match(fname) and given_match(fname):
-                    used_files.add(fname)
-                    return fname
+            hits = [f for f in music_files if family_match(f) and given_match(f)]
+            free = [f for f in hits if f not in used_files]
+            if free:
+                used_files.add(free[0])
+                return free[0], len(hits) > 1
 
-        # Pass 2: family-only fallback, prefer unused.
-        for fname in music_files:
-            if fname in used_files:
-                continue
-            if family_match(fname):
-                used_files.add(fname)
-                return fname
-        return ""
+        # Pass 2 (fuzzy): bare etternavn. Regnes alltid som usikker, f.eks. ved søsken.
+        if fuzzy:
+            for fname in music_files:
+                if fname not in used_files and family_match(fname):
+                    used_files.add(fname)
+                    return fname, True
+        return "", False
 
     # -------------------- Musikktabell --------------------
     def refresh_table(self):
@@ -2396,7 +2498,7 @@ class App:
                 tags = ("missing_music",)
             elif has_music and not row.get("MusikkSpillbar", True):
                 tags = ("audio_error",)
-            elif row.get("MusikkFormatAvvik"):
+            elif row.get("MusikkFormatAvvik") or row.get("MusikkUsikker"):
                 tags = ("audio_warning",)
             else:
                 tags = ()
@@ -2624,7 +2726,20 @@ class App:
             self.player_track_var.set(filename)
         self.player_time_var.set(player_name)
 
+    def stop_running_playback(self):
+        # Stopper VLC og intern avspilling før et nytt spor starter, så to spor aldri overlapper.
+        # Windows-standardspilleren (reserve) kan vi ikke styre.
+        if self.vlc_process and self.vlc_process.poll() is None:
+            try:
+                self.vlc_process.terminate()
+            except Exception:
+                pass
+        self.vlc_process = None
+        self.external_playback = False
+        self.release_internal_audio()
+
     def start_vlc_playback(self, path, filename, fallback_to_default=True):
+        self.stop_running_playback()
         vlc_path = find_vlc_executable()
         if vlc_path:
             try:
@@ -2653,6 +2768,7 @@ class App:
         return False
 
     def start_playback(self, path, filename):
+        self.stop_running_playback()
         if not self.ensure_audio_backend():
             self.log("Intern lydmotor er ikke tilgjengelig. Prøver VLC.")
             return self.start_vlc_playback(path, filename)
@@ -2868,13 +2984,27 @@ class App:
             return
         out_dir = self.output_dir()
         base_name = "Deltakerliste"
+        results = {}
         if self.var_excel.get():
-            generate_excel(self.rows, str(out_dir / f"{base_name}.xlsx"), self.log)
+            results["Excel"] = generate_excel(self.rows, str(out_dir / f"{base_name}.xlsx"), self.log)
         if self.var_html.get():
-            generate_html(self.rows, str(out_dir / f"{base_name}.html"), base_name, self.log)
+            results["HTML"] = generate_html(self.rows, str(out_dir / f"{base_name}.html"), base_name, self.log)
         if self.var_pdf.get():
-            generate_pdf(self.rows, str(out_dir / f"{base_name}.pdf"), base_name, self.log)
-        self.show_folder_link(out_dir, "Rapport ferdig", "Rapporten er lagret i:")
+            results["PDF"] = generate_pdf(self.rows, str(out_dir / f"{base_name}.pdf"), base_name, self.log)
+        if not results:
+            messagebox.showinfo("Info", "Velg minst ett format (PDF, Excel eller HTML) i Rapporter-menyen.")
+            return
+        self.report_export(results, out_dir, "Rapport ferdig", "Rapporten er lagret i:")
+
+    def report_export(self, results, out_dir, title, text):
+        # results: {formatnavn: lyktes}. Viser mappen bare når noe ble skrevet, og sier fra om det som feilet.
+        failed = [name for name, ok in results.items() if not ok]
+        if len(failed) == len(results):
+            messagebox.showerror("Feil", f"Kunne ikke lage {', '.join(failed)}. Se loggen for detaljer.")
+            return
+        if failed:
+            messagebox.showwarning("Delvis fullført", f"Kunne ikke lage {', '.join(failed)}. Se loggen for detaljer.")
+        self.show_folder_link(out_dir, title, text)
 
     def startliste_title(self):
         # Returnerer (tittel, filnavn uten endelse), eller None etter å ha vist feilen.
@@ -2920,10 +3050,11 @@ class App:
             return
         title, base_name = result
         out_dir = self.output_dir()
-        ok_excel = generate_startliste_excel(self.entries, str(out_dir / f"{base_name}.xlsx"), title, self.log)
-        ok_pdf = generate_startliste_pdf(self.entries, str(out_dir / f"{base_name}.pdf"), title, self.log)
-        if ok_excel or ok_pdf:
-            self.show_folder_link(out_dir, "Startliste ferdig", "Startlisten er lagret i:")
+        results = {
+            "Excel": generate_startliste_excel(self.entries, str(out_dir / f"{base_name}.xlsx"), title, self.log),
+            "PDF": generate_startliste_pdf(self.entries, str(out_dir / f"{base_name}.pdf"), title, self.log),
+        }
+        self.report_export(results, out_dir, "Startliste ferdig", "Startlisten er lagret i:")
 
     def generate_playlist_only(self):
         if not self.music_zip:
@@ -2934,8 +3065,8 @@ class App:
             messagebox.showwarning("Info", "Ingen utøvere i listen.")
             return
         out_dir = self.output_dir()
-        generate_vlc_playlist(active, out_dir, self.music_zip.stem, self.music_zip, self.log)
-        self.show_folder_link(out_dir, "Spilleliste ferdig", "Spillelisten er lagret i:")
+        ok = generate_vlc_playlist(active, out_dir, self.music_zip.stem, self.music_zip, self.log)
+        self.report_export({"spilleliste": ok}, out_dir, "Spilleliste ferdig", "Spillelisten er lagret i:")
 
     def show_folder_link(self, folder_path, title, text):
         win = tk.Toplevel(self.root, bg=BG)
