@@ -1138,6 +1138,8 @@ class App:
         self.pending_seek = None
         self.drag_position = None
         self.preview_job = None
+        # Lydfilen som vises i lydbølgen for valgt rad før avspilling.
+        self.preview_track = ""
         self.player_enabled = True
         self.wave_peaks = []
         self.wave_cache = {}
@@ -2822,7 +2824,9 @@ class App:
             self.log("Intern lydmotor er ikke tilgjengelig. Prøver VLC.")
             return self.start_vlc_playback(path, filename)
         row = self.find_row_by_mp3(filename)
-        self.current_duration = safe_int(row.get("MusikkSek")) if row else 0
+        # Lydbølge og lengde finnes allerede hvis raden har vært valgt.
+        cached_peaks, cached_length = self.wave_cache.get(str(path), ([], 0))
+        self.current_duration = (safe_int(row.get("MusikkSek")) if row else 0) or cached_length
         try:
             self.release_internal_audio()
             self.audio_backend.mixer.music.load(str(path))
@@ -2837,7 +2841,8 @@ class App:
         self.external_playback = False
         self.play_offset = 0.0
         self.pending_seek = None
-        self.wave_peaks = []
+        self.preview_track = ""
+        self.wave_peaks = cached_peaks
         self.wave_progress = 0.0
         self.draw_waveform()
         # Lydbølgen lages etter at musikken har startet, så lyden ikke venter på beregningen.
@@ -2933,6 +2938,7 @@ class App:
         if not self.ensure_audio_backend():
             return
         self.release_internal_audio()
+        self.preview_track = self.current_track if self.wave_peaks else ""
         self.current_track = ""
         self.is_paused = False
         self.external_playback = False
@@ -2950,6 +2956,7 @@ class App:
         self.play_offset = 0.0
         self.pending_seek = None
         self.drag_position = None
+        self.preview_track = ""
         self.wave_peaks = []
         self.wave_progress = 0.0
         self.play_pause_text.set("Spill")
@@ -2992,6 +2999,8 @@ class App:
         if (self.audio_ready and self.current_track and not self.is_paused
                 and not self.audio_backend.mixer.music.get_busy()):
             self.release_internal_audio()
+            # Lydbølgen blir stående, så man kan klikke i den for å spille sporet på nytt.
+            self.preview_track = self.current_track
             self.current_track = ""
             self.play_offset = 0.0
             self.play_pause_text.set("Spill")
@@ -3106,6 +3115,7 @@ class App:
             peaks, length = self.load_waveform(path)
         self.wave_peaks = peaks
         self.wave_progress = 0.0
+        self.preview_track = filename if peaks else ""
         self.current_duration = (safe_int(row.get("MusikkSek")) if row else 0) or length
         if row:
             title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
@@ -3159,16 +3169,28 @@ class App:
     def on_waveform_drag(self, event):
         # Mens man drar flyttes bare visningen; selve spolingen skjer når knappen slippes.
         width = self.wave_canvas.winfo_width()
-        if width <= 0 or not self.can_seek():
+        if width <= 0 or not (self.can_seek() or self.can_start_from_wave()):
             return
         fraction = max(0.0, min(1.0, event.x / width))
         self.drag_position = fraction * self.current_duration
         self.show_player_time(self.drag_position)
 
     def on_waveform_release(self, _event):
-        if self.drag_position is not None:
-            position, self.drag_position = self.drag_position, None
-            self.seek_to(position)
+        if self.drag_position is None:
+            return
+        position, self.drag_position = self.drag_position, None
+        if self.can_start_from_wave():
+            # Ingenting spilles: starter valgt rad fra stedet det ble klikket.
+            filename = self.preview_track
+            path = self.get_cached_mp3_path(filename)
+            if path and self.start_playback(path, filename):
+                self.seek_to(position)
+            return
+        self.seek_to(position)
+
+    def can_start_from_wave(self):
+        return (self.player_enabled and not self.current_track and not self.external_playback
+                and bool(self.preview_track) and self.current_duration > 0)
 
     def skip_seconds(self, seconds):
         if self.can_seek():

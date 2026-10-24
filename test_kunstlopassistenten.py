@@ -489,6 +489,7 @@ class PlayerTests(unittest.TestCase):
         app.play_offset = 0.0
         app.pending_seek = None
         app.drag_position = None
+        app.preview_track = ""
         app.wave_peaks = [0.5]
         app.wave_progress = 0.0
         for name in ("play_pause_text", "player_track_var", "player_time_var", "player_total_var",
@@ -601,6 +602,32 @@ class PlayerTests(unittest.TestCase):
         app.preview_selected_waveform()
 
         app.load_waveform.assert_not_called()
+
+    def test_click_in_preview_starts_from_position(self):
+        app = self.make_preview_app()
+        app.preview_selected_waveform()
+
+        def start_playback(path, filename):
+            app.current_track = filename
+            return True
+
+        app.start_playback = Mock(side_effect=start_playback)
+        app.on_waveform_drag(SimpleNamespace(x=50))
+        app.start_playback.assert_not_called()
+
+        app.on_waveform_release(None)
+
+        app.start_playback.assert_called_once_with(Path("sang.mp3"), "sang.mp3")
+        app.music.play.assert_called_once_with(start=47.5)
+
+    def test_stopped_track_can_be_restarted_from_waveform(self):
+        app = self.make_app()
+        app.ensure_audio_backend = Mock(return_value=True)
+
+        app.stop_playback()
+
+        self.assertEqual(app.preview_track, "sang.mp3")
+        self.assertTrue(app.can_start_from_wave())
 
     def test_quiet_cache_lookup_shows_no_dialogs(self):
         app = App.__new__(App)
