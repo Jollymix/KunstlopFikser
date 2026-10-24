@@ -1,11 +1,13 @@
 import io
+import queue
 import tempfile
 import unittest
 import wave
 import zipfile
+from array import array
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from datetime import datetime
 
@@ -14,6 +16,7 @@ from kunstlopassistenten import (
     add_missing_segments,
     auto_group_size,
     build_startliste,
+    compute_waveform,
     detect_audio_format,
     find_music_for_row,
     generate_startliste_excel,
@@ -482,16 +485,20 @@ class PlayerTests(unittest.TestCase):
         app.vlc_process = None
         app.external_playback = False
         app.player_enabled = True
+        app.seek_supported = True
         app.use_external_player_var = FakeVariable(False)
         app.current_track = "sang.mp3"
         app.current_duration = 120
         app.is_paused = paused
         app.play_offset = 0.0
-        app.pending_seek = None
         app.drag_position = None
         app.preview_track = ""
         app.wave_peaks = [0.5]
         app.wave_progress = 0.0
+        app.wave_cache = {}
+        app.wave_path = None
+        app.wave_loading = set()
+        app.wave_results = queue.Queue()
         for name in ("play_pause_text", "player_track_var", "player_time_var", "player_total_var",
                      "status_var", "music_info_var"):
             setattr(app, name, FakeVariable(""))
@@ -533,45 +540,60 @@ class PlayerTests(unittest.TestCase):
         self.assertEqual((app.current_track, app.current_duration, app.wave_peaks), ("", 0, []))
         self.assertEqual(app.player_track_var.get(), "Ingen spor valgt")
 
-    def test_seek_while_paused_waits_until_resume(self):
+    def test_seek_while_paused_keeps_audio_paused(self):
         app = self.make_app(paused=True)
 
         app.seek_to(30)
 
+        app.music.set_pos.assert_called_once_with(30)
         app.music.play.assert_not_called()
+        app.music.unpause.assert_not_called()
         self.assertEqual(app.current_position(), 30)
         self.assertEqual(app.player_time_var.get(), "0:30")
 
         app.toggle_play_pause()
 
-        app.music.play.assert_called_once_with(start=30)
-        app.music.unpause.assert_not_called()
-        self.assertFalse(app.is_paused)
-        self.assertIsNone(app.pending_seek)
+        app.music.unpause.assert_called_once()
+        app.music.play.assert_not_called()
 
-    def test_failed_seek_plays_from_start(self):
+    def test_failed_seek_keeps_playing_and_disables_seeking(self):
         app = self.make_app()
-        app.music.play.side_effect = [Exception("ikke støttet"), None]
-        app.music.get_pos.return_value = 0
+        app.play_offset = 40
+        app.music.set_pos.side_effect = Exception("ikke støttet")
 
         app.seek_to(30)
 
-        self.assertEqual(app.music.play.call_args_list[-1], ((),))
-        self.assertEqual(app.play_offset, 0.0)
-        self.assertEqual(app.player_time_var.get(), "0:00")
+        app.music.play.assert_not_called()
+        app.music.stop.assert_not_called()
+        self.assertEqual(app.current_position(), 45)
+        self.assertFalse(app.can_seek())
         self.assertIn("Spoling støttes ikke", app.status_var.get())
+
+        app.skip_seconds(10)
+
+        app.music.set_pos.assert_called_once()
 
     def test_drag_seeks_once_on_release(self):
         app = self.make_app()
 
         for x in (10, 20, 50):
             app.on_waveform_drag(SimpleNamespace(x=x))
-        app.music.play.assert_not_called()
+        app.music.set_pos.assert_not_called()
         self.assertEqual(app.player_time_var.get(), "1:00")
 
         app.on_waveform_release(None)
 
-        app.music.play.assert_called_once_with(start=60)
+        app.music.set_pos.assert_called_once_with(60)
+        app.music.play.assert_not_called()
+
+    def test_skip_uses_current_position(self):
+        app = self.make_app()
+        app.play_offset = 40
+
+        app.skip_seconds(-10)
+
+        app.music.set_pos.assert_called_once_with(35)
+        self.assertEqual(app.current_position(), 35)
 
     def make_preview_app(self):
         app = self.make_app()
@@ -581,7 +603,7 @@ class PlayerTests(unittest.TestCase):
         app.get_selected_mp3_filename = Mock(return_value="sang.mp3")
         app.get_cached_mp3_path = Mock(return_value=Path("sang.mp3"))
         app.ensure_audio_backend = Mock(return_value=True)
-        app.load_waveform = Mock(return_value=([0.2, 1.0], 96.0))
+        app.wave_cache[str(Path("sang.mp3"))] = ([0.2, 1.0], 96.0)
         return app
 
     def test_selecting_row_shows_waveform(self):
@@ -601,24 +623,85 @@ class PlayerTests(unittest.TestCase):
 
         app.preview_selected_waveform()
 
-        app.load_waveform.assert_not_called()
+        app.get_cached_mp3_path.assert_not_called()
 
-    def test_click_in_preview_starts_from_position(self):
+    def test_waveform_is_computed_in_background(self):
+        app = self.make_preview_app()
+        app.wave_cache = {}
+
+        with patch("kunstlopassistenten.threading.Thread") as thread:
+            app.preview_selected_waveform()
+
+        thread.return_value.start.assert_called_once()
+        self.assertEqual(app.wave_peaks, [])
+        self.assertEqual(app.player_total_var.get(), "1:35")
+
+        app.wave_results.put((str(Path("sang.mp3")), [0.3, 1.0], 96.0, ""))
+        app.poll_waveforms()
+
+        self.assertEqual(app.wave_peaks, [0.3, 1.0])
+        self.assertEqual(app.wave_loading, set())
+
+    def test_old_waveform_result_is_ignored(self):
+        app = self.make_preview_app()
+        app.wave_path = "ny.mp3"
+        app.wave_peaks = []
+        app.wave_loading = {"gammel.mp3"}
+
+        app.wave_results.put(("gammel.mp3", [1.0], 50.0, ""))
+        app.poll_waveforms()
+
+        self.assertEqual(app.wave_peaks, [])
+        self.assertIn("gammel.mp3", app.wave_cache)
+
+    def test_compute_waveform_normalizes_peaks(self):
+        samples = array("h", [0, 100, -200, 50] * 400)
+        sound = SimpleNamespace(get_length=lambda: 2.0, get_raw=lambda: samples.tobytes())
+        mixer = SimpleNamespace(Sound=lambda path: sound)
+
+        peaks, length, error = compute_waveform(mixer, "sang.mp3")
+
+        self.assertEqual((length, error), (2.0, ""))
+        self.assertEqual(max(peaks), 1.0)
+
+    def test_click_in_preview_starts_once_from_position(self):
         app = self.make_preview_app()
         app.preview_selected_waveform()
 
-        def start_playback(path, filename):
-            app.current_track = filename
-            return True
-
-        app.start_playback = Mock(side_effect=start_playback)
         app.on_waveform_drag(SimpleNamespace(x=50))
-        app.start_playback.assert_not_called()
-
+        app.music.play.assert_not_called()
         app.on_waveform_release(None)
 
-        app.start_playback.assert_called_once_with(Path("sang.mp3"), "sang.mp3")
-        app.music.play.assert_called_once_with(start=47.5)
+        self.assertEqual(app.music.play.call_args_list, [call(start=47.5)])
+        self.assertEqual(app.current_track, "sang.mp3")
+        self.assertEqual(app.play_offset, 47.5)
+
+    def test_unsupported_start_position_does_not_start_from_beginning(self):
+        app = self.make_preview_app()
+        app.preview_selected_waveform()
+        app.music.play.side_effect = Exception("ikke støttet")
+        app.start_vlc_playback = Mock()
+
+        app.on_waveform_drag(SimpleNamespace(x=50))
+        app.on_waveform_release(None)
+
+        self.assertEqual(app.music.play.call_args_list, [call(start=47.5)])
+        app.start_vlc_playback.assert_not_called()
+        self.assertEqual(app.current_track, "")
+        self.assertIn("Spoling støttes ikke", app.status_var.get())
+
+    def test_vlc_fallback_gets_start_position(self):
+        app = self.make_preview_app()
+        app.preview_selected_waveform()
+        app.music.load.side_effect = Exception("ukjent format")
+
+        with patch("kunstlopassistenten.find_vlc_executable", return_value="vlc.exe"), \
+                patch("kunstlopassistenten.subprocess.Popen") as popen:
+            app.on_waveform_drag(SimpleNamespace(x=50))
+            app.on_waveform_release(None)
+
+        self.assertIn("--start-time=47.5", popen.call_args.args[0])
+        app.music.play.assert_not_called()
 
     def test_stopped_track_can_be_restarted_from_waveform(self):
         app = self.make_app()
@@ -640,13 +723,15 @@ class PlayerTests(unittest.TestCase):
         messagebox.showerror.assert_not_called()
         messagebox.showinfo.assert_not_called()
 
-    def test_skip_uses_current_position(self):
+    def test_disabled_skip_button_ignores_keyboard(self):
         app = self.make_app()
-        app.play_offset = 40
+        app.seek_supported = False
+        command = Mock()
 
-        app.skip_seconds(-10)
-
-        app.music.play.assert_called_once_with(start=35)
+        self.assertEqual(app.press_player_button("forward", command), "break")
+        command.assert_not_called()
+        app.press_player_button("stop", command)
+        command.assert_called_once()
 
 
 if __name__ == "__main__":

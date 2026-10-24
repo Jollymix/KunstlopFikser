@@ -17,6 +17,8 @@ import re
 import json
 import shutil
 import wave
+import threading
+import queue
 from tkinter import font as tkfont
 from xml.sax.saxutils import escape as xml_escape
 
@@ -1100,6 +1102,26 @@ def style_window_frame(win):
         pass
 
 
+def compute_waveform(mixer, path):
+    # Dekoder lydfilen med pygame og lager toppverdier til lydbølgen (~0,1 s per fil).
+    # Kjøres i en bakgrunnstråd, så den returnerer feilen i stedet for å logge den.
+    try:
+        sound = mixer.Sound(path)
+        length = sound.get_length()
+        raw = sound.get_raw()
+    except Exception as exc:
+        return [], 0, str(exc)
+    samples = memoryview(raw)[: len(raw) // 2 * 2].cast("h")
+    bucket = max(1, len(samples) // WAVE_BARS)
+    stride = max(1, bucket // 400) | 1
+    peaks = []
+    for i in range(WAVE_BARS):
+        part = samples[i * bucket:(i + 1) * bucket:stride]
+        peaks.append(max(max(part), -min(part)) if len(part) else 0)
+    top = max(peaks) or 1
+    return [p / top for p in peaks], length, ""
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -1134,8 +1156,7 @@ class App:
         self.external_playback = False
         # Avspillerens posisjon: get_pos() teller fra siste play(), så spoling legges til her.
         self.play_offset = 0.0
-        # Spoling mens sporet er pauset lagres her og brukes når avspillingen fortsetter.
-        self.pending_seek = None
+        self.seek_supported = True
         self.drag_position = None
         self.preview_job = None
         # Lydfilen som vises i lydbølgen for valgt rad før avspilling.
@@ -1144,6 +1165,10 @@ class App:
         self.wave_peaks = []
         self.wave_cache = {}
         self.wave_progress = 0.0
+        # Lydbølgen som skal vises, filer som beregnes i bakgrunnen, og ferdige resultater.
+        self.wave_path = None
+        self.wave_loading = set()
+        self.wave_results = queue.Queue()
         self.play_pause_text = tk.StringVar(value="Spill")
         self.use_external_player_var = tk.BooleanVar(value=False)
 
@@ -1621,12 +1646,16 @@ class App:
             ("forward", 34, lambda: self.skip_seconds(SKIP_SECONDS)),
             ("stop", 34, self.stop_playback),
         ):
+            # Knappene kan nås med Tab og trykkes med Enter eller mellomrom.
             canvas = tk.Canvas(player, width=size, height=size, bg=FIELD, highlightthickness=0,
-                               cursor="hand2")
+                               cursor="hand2", takefocus=1)
             canvas.pack(side="left", padx=(0, 8))
-            canvas.bind("<Button-1>", lambda e, c=command: self.player_enabled and c())
+            press = lambda e, n=name, c=command: self.press_player_button(n, c)
+            for sequence in ("<Button-1>", "<Return>", "<space>"):
+                canvas.bind(sequence, press)
             canvas.bind("<Enter>", lambda e, n=name: self.draw_player_button(n, hover=True))
-            canvas.bind("<Leave>", lambda e, n=name: self.draw_player_button(n))
+            for sequence in ("<Leave>", "<FocusIn>", "<FocusOut>"):
+                canvas.bind(sequence, lambda e, n=name: self.draw_player_button(n))
             self.player_buttons[name] = canvas
         self.player_time_var = tk.StringVar(value="0:00")
         self.player_total_var = tk.StringVar(value="0:00")
@@ -2771,6 +2800,7 @@ class App:
             self.player_track_var.set(f"{title} - {filename}".strip(" -"))
         else:
             self.player_track_var.set(filename)
+        self.wave_path = None
         self.wave_peaks = []
         self.wave_progress = 0.0
         self.draw_waveform()
@@ -2789,14 +2819,15 @@ class App:
         self.external_playback = False
         self.release_internal_audio()
 
-    def start_vlc_playback(self, path, filename, fallback_to_default=True):
+    def start_vlc_playback(self, path, filename, fallback_to_default=True, start=0.0):
         self.stop_running_playback()
         vlc_path = find_vlc_executable()
         if vlc_path:
+            args = [vlc_path, "--play-and-exit", "--no-video"]
+            if start:
+                args.append(f"--start-time={start:.1f}")
             try:
-                self.vlc_process = subprocess.Popen(
-                    [vlc_path, "--play-and-exit", "--no-video", str(path)]
-                )
+                self.vlc_process = subprocess.Popen(args + [str(path)])
                 self.set_external_playback_status(filename, "VLC")
                 self.log(f"Spiller med VLC: {filename}")
                 return True
@@ -2804,6 +2835,8 @@ class App:
                 self.log(f"Kunne ikke starte VLC: {exc}")
 
         if fallback_to_default:
+            if start:
+                self.log("Windows-standardspilleren kan ikke starte midt i sporet. Starter fra begynnelsen.")
             try:
                 os.startfile(str(path))
                 self.set_external_playback_status(filename, "Ekstern avspiller")
@@ -2818,35 +2851,48 @@ class App:
         )
         return False
 
-    def start_playback(self, path, filename):
+    def start_playback(self, path, filename, start=0.0):
+        # start: sekunder inn i sporet. Avspillingen startes én gang, direkte fra posisjonen.
         self.stop_running_playback()
         if not self.ensure_audio_backend():
             self.log("Intern lydmotor er ikke tilgjengelig. Prøver VLC.")
-            return self.start_vlc_playback(path, filename)
+            return self.start_vlc_playback(path, filename, start=start)
         row = self.find_row_by_mp3(filename)
-        # Lydbølge og lengde finnes allerede hvis raden har vært valgt.
-        cached_peaks, cached_length = self.wave_cache.get(str(path), ([], 0))
-        self.current_duration = (safe_int(row.get("MusikkSek")) if row else 0) or cached_length
+        music = self.audio_backend.mixer.music
         try:
             self.release_internal_audio()
-            self.audio_backend.mixer.music.load(str(path))
-            self.audio_backend.mixer.music.play()
+            music.load(str(path))
         except Exception as exc:
             self.log(f"Kunne ikke spille av med intern avspiller: {exc}")
             self.release_internal_audio()
             self.log("Prøver VLC som reserveavspiller.")
+            return self.start_vlc_playback(path, filename, start=start)
+        try:
+            if start:
+                music.play(start=start)
+            else:
+                music.play()
+        except Exception as exc:
+            self.release_internal_audio()
+            if start:
+                # Filen kan spilles, men ikke spoles i: starter ikke noe operatøren ikke ba om.
+                self.log(f"Kunne ikke starte {filename} fra {format_duration(start)} ({exc}).")
+                self.status_var.set("Spoling støttes ikke for dette sporet. Trykk play for å spille fra start.")
+                return False
+            self.log(f"Kunne ikke spille av med intern avspiller: {exc}")
+            self.log("Prøver VLC som reserveavspiller.")
             return self.start_vlc_playback(path, filename)
+        # Lengden finnes allerede hvis raden har vært valgt.
+        self.current_duration = (safe_int(row.get("MusikkSek")) if row else 0) or self.wave_cache.get(
+            str(path), ([], 0))[1]
         self.current_track = filename
         self.is_paused = False
         self.external_playback = False
-        self.play_offset = 0.0
-        self.pending_seek = None
+        self.play_offset = start
+        self.set_seek_supported(True)
         self.preview_track = ""
-        self.wave_peaks = cached_peaks
         self.wave_progress = 0.0
-        self.draw_waveform()
-        # Lydbølgen lages etter at musikken har startet, så lyden ikke venter på beregningen.
-        self.root.after(30, lambda: self.show_waveform(path, filename))
+        self.request_waveform(path)
         self.play_pause_text.set("Pause")
         if row:
             title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
@@ -2885,16 +2931,7 @@ class App:
             )
             return
         if self.audio_ready and self.is_paused:
-            if self.pending_seek is not None:
-                seconds, self.pending_seek = self.pending_seek, None
-                try:
-                    self.play_from(seconds)
-                except Exception as exc:
-                    self.log(f"Kunne ikke fortsette avspillingen: {exc}")
-                    self.reset_player()
-                    return
-            else:
-                self.audio_backend.mixer.music.unpause()
+            self.audio_backend.mixer.music.unpause()
             self.is_paused = False
             self.play_pause_text.set("Pause")
             self.log("Fortsetter avspilling.")
@@ -2943,7 +2980,6 @@ class App:
         self.is_paused = False
         self.external_playback = False
         self.play_offset = 0.0
-        self.pending_seek = None
         self.play_pause_text.set("Spill")
         self.log("Stoppet avspilling.")
 
@@ -2954,9 +2990,10 @@ class App:
         self.current_duration = 0
         self.is_paused = False
         self.play_offset = 0.0
-        self.pending_seek = None
         self.drag_position = None
         self.preview_track = ""
+        self.wave_path = None
+        self.set_seek_supported(True)
         self.wave_peaks = []
         self.wave_progress = 0.0
         self.play_pause_text.set("Spill")
@@ -3009,8 +3046,6 @@ class App:
         self.root.after(200, self.update_player_ui)
 
     def current_position(self):
-        if self.pending_seek is not None:
-            return self.pending_seek
         if not self.audio_ready or not self.current_track:
             return 0.0
         return self.play_offset + max(0, self.audio_backend.mixer.music.get_pos()) / 1000.0
@@ -3046,16 +3081,19 @@ class App:
         size = int(canvas["width"])
         c = size / 2
         canvas.delete("all")
-        big = name == "play"
-        if big:
-            fill = ACCENT_HOVER if hover and self.player_enabled else ACCENT
+        enabled = self.player_button_enabled(name)
+        if name == "play":
+            fill = ACCENT_HOVER if hover and enabled else ACCENT
             outline, icon = fill, ACCENT_TEXT
         else:
-            fill = BUTTON_HOVER if hover and self.player_enabled else FIELD
+            fill = BUTTON_HOVER if hover and enabled else FIELD
             outline, icon = LINE, ACCENT
-        if not self.player_enabled:
+        if not enabled:
             fill, outline, icon = PANEL, LINE, TEXT_DISABLED
-        canvas.create_oval(1, 1, size - 2, size - 2, fill=fill, outline=outline, width=1.5)
+        # Tastaturfokus vises som en lys ring rundt knappen.
+        focused = self.root.focus_get() is canvas
+        canvas.create_oval(2, 2, size - 3, size - 3, fill=fill, outline=TEXT if focused else outline,
+                           width=2.5 if focused else 1.5)
         u = size / 10
         if name == "play" and self.play_pause_text.get() == "Pause":
             for x in (c - 1.6 * u, c + 0.6 * u):
@@ -3074,27 +3112,67 @@ class App:
                 canvas.create_line(x - d * u, c - 1.3 * u, x + d * 0.3 * u, c, x - d * u, c + 1.3 * u,
                                    fill=icon, width=1.8, capstyle="round", joinstyle="round")
 
-    def load_waveform(self, path):
-        # Leser lydfilen med pygame og lager toppverdier til lydbølgen. Tar ~0,1 s per fil.
+    def press_player_button(self, name, command):
+        if self.player_button_enabled(name):
+            command()
+        return "break"
+
+    def player_button_enabled(self, name):
+        if not self.player_enabled:
+            return False
+        return self.seek_supported or name not in ("back", "forward")
+
+    def set_seek_supported(self, supported):
+        self.seek_supported = supported
+        for name in ("back", "forward"):
+            if name in self.player_buttons:
+                self.draw_player_button(name)
+
+    def request_waveform(self, path):
+        # Lydbølgen beregnes i en bakgrunnstråd; visningen oppdateres i GUI-tråden når den er klar.
         key = str(path)
-        if key not in self.wave_cache:
-            peaks, length = [], 0
+        self.wave_path = key
+        if key in self.wave_cache:
+            self.apply_waveform(key)
+            return
+        self.wave_peaks = []
+        self.draw_waveform()
+        if key in self.wave_loading:
+            return
+        if not self.wave_loading:
+            self.root.after(50, self.poll_waveforms)
+        self.wave_loading.add(key)
+        mixer = self.audio_backend.mixer
+        threading.Thread(target=lambda: self.wave_results.put((key, *compute_waveform(mixer, key))),
+                         daemon=True).start()
+
+    def poll_waveforms(self):
+        while True:
             try:
-                sound = self.audio_backend.mixer.Sound(key)
-                length = sound.get_length()
-                raw = sound.get_raw()
-                samples = memoryview(raw)[: len(raw) // 2 * 2].cast("h")
-                bucket = max(1, len(samples) // WAVE_BARS)
-                stride = max(1, bucket // 400) | 1
-                for i in range(WAVE_BARS):
-                    part = samples[i * bucket:(i + 1) * bucket:stride]
-                    peaks.append(max(max(part), -min(part)) if len(part) else 0)
-                top = max(peaks) or 1
-                peaks = [p / top for p in peaks]
-            except Exception as exc:
-                self.log(f"Kunne ikke lage lydbølge: {exc}")
+                key, peaks, length, error = self.wave_results.get_nowait()
+            except queue.Empty:
+                break
+            self.wave_loading.discard(key)
+            if error:
+                self.log(f"Kunne ikke lage lydbølge: {error}")
             self.wave_cache[key] = (peaks, length)
-        return self.wave_cache[key]
+            self.apply_waveform(key)
+        if self.wave_loading:
+            self.root.after(50, self.poll_waveforms)
+
+    def apply_waveform(self, key):
+        # Bare lydbølgen for sporet som vises nå tegnes; svar for tidligere valgte rader ignoreres.
+        if key != self.wave_path:
+            return
+        self.wave_peaks, length = self.wave_cache[key]
+        if not self.current_duration:
+            self.current_duration = length
+        if not self.wave_peaks and not self.current_track:
+            # pygame kan ikke lese filen, så den kan heller ikke startes fra lydbølgen.
+            self.preview_track = ""
+        self.draw_waveform()
+        if self.drag_position is None:
+            self.show_player_time(self.current_position())
 
     def schedule_waveform_preview(self):
         # Venter litt, så piltaster gjennom listen ikke leser hver eneste lydfil.
@@ -3109,29 +3187,23 @@ class App:
             return
         filename = self.get_selected_mp3_filename()
         row = self.find_row_by_mp3(filename) if filename else None
-        peaks, length = [], 0
         path = self.get_cached_mp3_path(filename, quiet=True) if filename else None
-        if path and self.ensure_audio_backend():
-            peaks, length = self.load_waveform(path)
-        self.wave_peaks = peaks
         self.wave_progress = 0.0
-        self.preview_track = filename if peaks else ""
-        self.current_duration = (safe_int(row.get("MusikkSek")) if row else 0) or length
+        self.current_duration = safe_int(row.get("MusikkSek")) if row else 0
         if row:
             title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
             self.player_track_var.set(f"{title} - {filename}".strip(" -"))
         else:
             self.player_track_var.set("Ingen lydfil på valgt rad")
-        self.draw_waveform()
+        if path and self.ensure_audio_backend():
+            self.preview_track = filename
+            self.request_waveform(path)
+        else:
+            self.preview_track = ""
+            self.wave_path = None
+            self.wave_peaks = []
+            self.draw_waveform()
         self.show_player_time()
-
-    def show_waveform(self, path, filename):
-        if self.current_track != filename or self.external_playback:
-            return
-        self.wave_peaks, length = self.load_waveform(path)
-        if not self.current_duration:
-            self.current_duration = length
-        self.draw_waveform()
 
     def draw_waveform(self):
         canvas = self.wave_canvas
@@ -3163,7 +3235,7 @@ class App:
         self.wave_drawn = played
 
     def can_seek(self):
-        return (self.player_enabled and self.audio_ready and bool(self.current_track)
+        return (self.player_enabled and self.seek_supported and self.audio_ready and bool(self.current_track)
                 and not self.external_playback and self.current_duration > 0)
 
     def on_waveform_drag(self, event):
@@ -3180,11 +3252,11 @@ class App:
             return
         position, self.drag_position = self.drag_position, None
         if self.can_start_from_wave():
-            # Ingenting spilles: starter valgt rad fra stedet det ble klikket.
+            # Ingenting spilles: starter valgt rad direkte fra stedet det ble klikket.
             filename = self.preview_track
             path = self.get_cached_mp3_path(filename)
-            if path and self.start_playback(path, filename):
-                self.seek_to(position)
+            if path:
+                self.start_playback(path, filename, start=self.clamp_position(position))
             return
         self.seek_to(position)
 
@@ -3196,32 +3268,25 @@ class App:
         if self.can_seek():
             self.seek_to(self.current_position() + seconds)
 
-    def play_from(self, seconds):
-        # pygame kan ikke spole i alle formater. Da spilles sporet fra start, og operatøren får beskjed.
-        music = self.audio_backend.mixer.music
-        try:
-            music.play(start=seconds)
-        except Exception as exc:
-            self.log(f"Kunne ikke spole i {self.current_track} ({exc}). Spiller fra start.")
-            self.status_var.set("Spoling støttes ikke for dette sporet. Spiller fra start.")
-            music.play()
-            seconds = 0.0
-        self.play_offset = seconds
+    def clamp_position(self, seconds):
+        return max(0.0, min(seconds, self.current_duration - 0.5))
 
     def seek_to(self, seconds):
-        # Spoler i sporet som spilles. Er sporet pauset, lagres bare posisjonen til det fortsetter.
+        # set_pos flytter posisjonen uten å starte sporet på nytt, også når det er pauset.
+        # Feiler den, spiller sporet videre der det var, og spoling slås av for sporet.
         if not self.can_seek():
             return
-        seconds = max(0.0, min(seconds, self.current_duration - 0.5))
-        if self.is_paused:
-            self.pending_seek = seconds
-        else:
-            try:
-                self.play_from(seconds)
-            except Exception as exc:
-                self.log(f"Avspillingen stoppet: {exc}")
-                self.reset_player()
-                return
+        seconds = self.clamp_position(seconds)
+        music = self.audio_backend.mixer.music
+        try:
+            music.set_pos(seconds)
+        except Exception as exc:
+            self.set_seek_supported(False)
+            self.log(f"Kunne ikke spole i {self.current_track} ({exc}). Spoling er slått av for dette sporet.")
+            self.status_var.set("Spoling støttes ikke for dette sporet.")
+            return
+        # get_pos() teller tid siden play() og påvirkes ikke av set_pos.
+        self.play_offset = seconds - max(0, music.get_pos()) / 1000.0
         self.show_player_time(self.current_position())
 
     # -------------------- Lagring og eksport --------------------
