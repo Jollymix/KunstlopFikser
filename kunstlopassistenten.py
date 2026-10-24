@@ -50,6 +50,9 @@ MUSIC_STATUS_TEXT = {
     "profile not matched": "Profil ikke koblet",
 }
 AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".mp4", ".aac"}
+# Avspilleren: spoling med « » og antall streker i lydbølgen.
+SKIP_SECONDS = 10
+WAVE_BARS = 160
 # Kolonner i deltakerrapporten (Excel, HTML og PDF).
 REPORT_HEADERS = ["PrintName", "Organisation", "Klasse", "Program", "Påmelding", "StartTid", "SluttTid",
                   "MusikkStatus", "MusikkTid"]
@@ -1129,6 +1132,12 @@ class App:
         self.is_paused = False
         self.current_duration = 0
         self.external_playback = False
+        # Avspillerens posisjon: get_pos() teller fra siste play(), så spoling legges til her.
+        self.play_offset = 0.0
+        self.player_enabled = True
+        self.wave_peaks = []
+        self.wave_cache = {}
+        self.wave_progress = 0.0
         self.play_pause_text = tk.StringVar(value="Spill")
         self.use_external_player_var = tk.BooleanVar(value=False)
 
@@ -1588,22 +1597,43 @@ class App:
         self.menu_tabellvisning.add_separator()
         self.menu_tabellvisning.add_command(label="Vis alle kolonner", command=self.show_all_table_columns)
 
-        player = ttk.Frame(p, style="Panel.TFrame")
-        player.grid(row=4, column=0, sticky="we", pady=(16, 0))
-        self.btn_player_play_pause = ttk.Button(player, textvariable=self.play_pause_text,
-                                                style="Accent.TButton", command=self.toggle_play_pause,
-                                                width=8)
-        self.btn_player_play_pause.pack(side="left")
-        self.btn_player_stop = ttk.Button(player, text="Stopp", command=self.stop_playback, width=8)
-        self.btn_player_stop.pack(side="left", padx=(8, 0))
-        info = ttk.Frame(player, style="Panel.TFrame")
-        info.pack(side="left", fill="x", expand=True, padx=(18, 0))
+        # Avspiller i kort med runde knapper og lydbølge man kan klikke i for å spole.
+        card = tk.Frame(p, bg=FIELD, highlightbackground=LINE, highlightthickness=1, padx=14, pady=10)
+        card.grid(row=4, column=0, sticky="we", pady=(16, 0))
+        player = tk.Frame(card, bg=FIELD)
+        player.pack(fill="x")
+        self.player_buttons = {}
+        for name, size, command in (
+            ("back", 34, lambda: self.skip_seconds(-SKIP_SECONDS)),
+            ("play", 50, self.toggle_play_pause),
+            ("forward", 34, lambda: self.skip_seconds(SKIP_SECONDS)),
+            ("stop", 34, self.stop_playback),
+        ):
+            canvas = tk.Canvas(player, width=size, height=size, bg=FIELD, highlightthickness=0,
+                               cursor="hand2")
+            canvas.pack(side="left", padx=(0, 8))
+            canvas.bind("<Button-1>", lambda e, c=command: self.player_enabled and c())
+            canvas.bind("<Enter>", lambda e, n=name: self.draw_player_button(n, hover=True))
+            canvas.bind("<Leave>", lambda e, n=name: self.draw_player_button(n))
+            self.player_buttons[name] = canvas
+        self.player_time_var = tk.StringVar(value="0:00")
+        self.player_total_var = tk.StringVar(value="0:00")
+        ttk.Label(player, textvariable=self.player_total_var, background=FIELD,
+                  font=self.fonts["head"], foreground=ACCENT).pack(side="right")
+        ttk.Label(player, text=" / ", background=FIELD, foreground=TEXT_DIM).pack(side="right")
+        ttk.Label(player, textvariable=self.player_time_var, background=FIELD,
+                  foreground=TEXT_DIM).pack(side="right")
+        self.wave_canvas = tk.Canvas(player, height=50, bg=FIELD, highlightthickness=0, cursor="hand2")
+        self.wave_canvas.pack(side="left", fill="x", expand=True, padx=(6, 14))
+        self.wave_canvas.bind("<Configure>", lambda e: self.draw_waveform())
+        self.wave_canvas.bind("<Button-1>", self.on_waveform_click)
+        self.wave_canvas.bind("<B1-Motion>", self.on_waveform_click)
         self.player_track_var = tk.StringVar(value="Ingen spor valgt")
-        self.player_time_var = tk.StringVar(value="0:00 / 0:00")
-        ttk.Label(info, textvariable=self.player_track_var, style="PanelHead.TLabel").pack(anchor="w")
-        self.player_progress = ttk.Progressbar(info, mode="determinate")
-        self.player_progress.pack(fill="x", pady=4)
-        ttk.Label(info, textvariable=self.player_time_var, style="PanelDim.TLabel").pack(anchor="w")
+        ttk.Label(card, textvariable=self.player_track_var, background=FIELD,
+                  foreground=TEXT_DIM, font=self.fonts["small"]).pack(anchor="w", pady=(8, 0))
+        self.play_pause_text.trace_add("write", lambda *_: self.draw_player_button("play"))
+        for name in self.player_buttons:
+            self.draw_player_button(name)
 
     # -------------------- Generelt --------------------
     def log(self, msg):
@@ -2724,7 +2754,11 @@ class App:
             self.player_track_var.set(f"{title} - {filename}".strip(" -"))
         else:
             self.player_track_var.set(filename)
+        self.wave_peaks = []
+        self.wave_progress = 0.0
+        self.draw_waveform()
         self.player_time_var.set(player_name)
+        self.player_total_var.set("")
 
     def stop_running_playback(self):
         # Stopper VLC og intern avspilling før et nytt spor starter, så to spor aldri overlapper.
@@ -2786,6 +2820,12 @@ class App:
         self.current_track = filename
         self.is_paused = False
         self.external_playback = False
+        self.play_offset = 0.0
+        self.wave_peaks, length = self.load_waveform(path)
+        if not self.current_duration:
+            self.current_duration = length
+        self.wave_progress = 0.0
+        self.draw_waveform()
         self.play_pause_text.set("Pause")
         if row:
             title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
@@ -2871,6 +2911,7 @@ class App:
         self.current_track = ""
         self.is_paused = False
         self.external_playback = False
+        self.play_offset = 0.0
         self.play_pause_text.set("Spill")
         self.log("Stoppet avspilling.")
 
@@ -2903,44 +2944,157 @@ class App:
                 self.current_track = ""
                 self.external_playback = False
                 self.play_pause_text.set("Spill")
-                self.player_time_var.set("0:00 / 0:00")
-            self.player_progress.config(maximum=1, value=0)
+                self.player_time_var.set("0:00")
+                self.player_total_var.set("0:00")
             self.root.after(500, self.update_player_ui)
             return
         elapsed = 0
-        if self.audio_ready:
+        if self.audio_ready and self.current_track:
+            elapsed = self.play_offset
             pos_ms = self.audio_backend.mixer.music.get_pos()
             if pos_ms and pos_ms > 0:
-                elapsed = pos_ms / 1000.0
-            if (
-                self.current_track
-                and not self.is_paused
-                and not self.audio_backend.mixer.music.get_busy()
-            ):
+                elapsed += pos_ms / 1000.0
+            if not self.is_paused and not self.audio_backend.mixer.music.get_busy():
                 self.release_internal_audio()
                 self.current_track = ""
+                self.play_offset = 0.0
+                elapsed = 0
                 self.play_pause_text.set("Spill")
         duration = self.current_duration or 0
         if duration > 0:
-            self.player_progress.config(maximum=duration, value=min(elapsed, duration))
-            elapsed_text = format_duration(elapsed)
-            total_text = format_duration(duration)
-            self.player_time_var.set(f"{elapsed_text} / {total_text}")
-        else:
-            self.player_progress.config(maximum=1, value=0)
-            self.player_time_var.set("0:00 / 0:00")
-        self.root.after(500, self.update_player_ui)
+            elapsed = min(elapsed, duration)
+            self.player_time_var.set(format_duration(elapsed))
+            self.player_total_var.set(format_duration(duration))
+            self.set_wave_progress(elapsed / duration)
+        elif self.player_enabled:
+            self.player_time_var.set("0:00")
+            self.player_total_var.set("0:00")
+            self.set_wave_progress(0.0)
+        self.root.after(200, self.update_player_ui)
 
     def on_use_external_player_toggle(self):
-        if self.use_external_player_var.get():
+        self.player_enabled = not self.use_external_player_var.get()
+        if not self.player_enabled:
             self.player_time_var.set("VLC direkte")
-            self.btn_player_play_pause.config(state="disabled")
-            self.btn_player_stop.config(state="disabled")
+            self.player_total_var.set("")
+        elif not self.external_playback:
+            self.player_time_var.set("0:00")
+            self.player_total_var.set("0:00")
+        for name in self.player_buttons:
+            self.draw_player_button(name)
+
+    # -------------------- Avspillerens tegning og spoling --------------------
+    def draw_player_button(self, name, hover=False):
+        canvas = self.player_buttons[name]
+        size = int(canvas["width"])
+        c = size / 2
+        canvas.delete("all")
+        big = name == "play"
+        if big:
+            fill = ACCENT_HOVER if hover and self.player_enabled else ACCENT
+            outline, icon = fill, ACCENT_TEXT
         else:
-            if not self.external_playback:
-                self.player_time_var.set("0:00 / 0:00")
-            self.btn_player_play_pause.config(state="normal")
-            self.btn_player_stop.config(state="normal")
+            fill = BUTTON_HOVER if hover and self.player_enabled else FIELD
+            outline, icon = LINE, ACCENT
+        if not self.player_enabled:
+            fill, outline, icon = PANEL, LINE, TEXT_DISABLED
+        canvas.create_oval(1, 1, size - 2, size - 2, fill=fill, outline=outline, width=1.5)
+        u = size / 10
+        if name == "play" and self.play_pause_text.get() == "Pause":
+            for x in (c - 1.6 * u, c + 0.6 * u):
+                canvas.create_rectangle(x, c - 1.6 * u, x + u, c + 1.6 * u, fill=icon, outline="")
+        elif name == "play":
+            canvas.create_polygon(c - 1.1 * u, c - 1.7 * u, c + 1.7 * u, c, c - 1.1 * u, c + 1.7 * u,
+                                  fill=icon, outline="")
+        elif name == "stop":
+            canvas.create_rectangle(c - 1.3 * u, c - 1.3 * u, c + 1.3 * u, c + 1.3 * u, fill=icon,
+                                    outline="")
+        else:
+            # « og »: to vinkler, speilet for spoling bakover.
+            d = -1 if name == "back" else 1
+            for dx in (-1.1 * u, 0.9 * u):
+                x = c + d * dx
+                canvas.create_line(x - d * u, c - 1.3 * u, x + d * 0.3 * u, c, x - d * u, c + 1.3 * u,
+                                   fill=icon, width=1.8, capstyle="round", joinstyle="round")
+
+    def load_waveform(self, path):
+        # Leser lydfilen med pygame og lager toppverdier til lydbølgen. Tar ~0,1 s per fil.
+        key = str(path)
+        if key not in self.wave_cache:
+            peaks, length = [], 0
+            try:
+                sound = self.audio_backend.mixer.Sound(key)
+                length = sound.get_length()
+                raw = sound.get_raw()
+                samples = memoryview(raw)[: len(raw) // 2 * 2].cast("h")
+                bucket = max(1, len(samples) // WAVE_BARS)
+                stride = max(1, bucket // 400) | 1
+                for i in range(WAVE_BARS):
+                    part = samples[i * bucket:(i + 1) * bucket:stride]
+                    peaks.append(max(max(part), -min(part)) if len(part) else 0)
+                top = max(peaks) or 1
+                peaks = [p / top for p in peaks]
+            except Exception as exc:
+                self.log(f"Kunne ikke lage lydbølge: {exc}")
+            self.wave_cache[key] = (peaks, length)
+        return self.wave_cache[key]
+
+    def draw_waveform(self):
+        canvas = self.wave_canvas
+        canvas.delete("all")
+        width, height = canvas.winfo_width(), int(canvas["height"])
+        mid = height / 2
+        if not self.wave_peaks:
+            canvas.create_line(0, mid, width, mid, fill=LINE, width=2)
+            self.wave_bars = []
+            return
+        step = width / len(self.wave_peaks)
+        bar = max(1.0, step * 0.55)
+        self.wave_bars = []
+        for i, peak in enumerate(self.wave_peaks):
+            h = max(2.0, peak * (height - 4) / 2)
+            x = i * step
+            self.wave_bars.append(canvas.create_rectangle(x, mid - h, x + bar, mid + h, outline=""))
+        self.wave_drawn = -1
+        self.set_wave_progress(self.wave_progress)
+
+    def set_wave_progress(self, fraction):
+        self.wave_progress = fraction
+        bars = getattr(self, "wave_bars", [])
+        played = int(round(fraction * len(bars)))
+        if played == getattr(self, "wave_drawn", -1):
+            return
+        for i, item in enumerate(bars):
+            self.wave_canvas.itemconfigure(item, fill=ACCENT if i < played else LINE)
+        self.wave_drawn = played
+
+    def on_waveform_click(self, event):
+        width = self.wave_canvas.winfo_width()
+        if width > 0 and self.current_duration:
+            self.seek_to(event.x / width * self.current_duration)
+
+    def skip_seconds(self, seconds):
+        if self.current_track and not self.external_playback:
+            elapsed = self.play_offset + max(0, self.audio_backend.mixer.music.get_pos()) / 1000.0
+            self.seek_to(elapsed + seconds)
+
+    def seek_to(self, seconds):
+        # Spoler i sporet som spilles. Starter avspillingen på nytt fra posisjonen, og beholder pause.
+        if not self.player_enabled or not self.audio_ready or not self.current_track or self.external_playback:
+            return
+        seconds = max(0.0, min(seconds, max(0.0, (self.current_duration or 0) - 0.5)))
+        music = self.audio_backend.mixer.music
+        try:
+            music.play(start=seconds)
+            if self.is_paused:
+                music.pause()
+        except Exception as exc:
+            self.log(f"Kunne ikke spole: {exc}")
+            return
+        self.play_offset = seconds
+        if self.current_duration:
+            self.player_time_var.set(format_duration(seconds))
+            self.set_wave_progress(seconds / self.current_duration)
 
     # -------------------- Lagring og eksport --------------------
     def row_key(self, row):
