@@ -470,5 +470,116 @@ class RegressionTests(unittest.TestCase):
         self.assertFalse(app.external_playback)
 
 
+class PlayerTests(unittest.TestCase):
+    def make_app(self, paused=False):
+        # Avspiller med falsk mixer: ett spor på 120 s som spilles internt.
+        app = App.__new__(App)
+        app.music = Mock()
+        app.music.get_pos.return_value = 5000
+        app.music.get_busy.return_value = not paused
+        app.audio_backend = SimpleNamespace(mixer=SimpleNamespace(music=app.music))
+        app.audio_ready = True
+        app.vlc_process = None
+        app.external_playback = False
+        app.player_enabled = True
+        app.use_external_player_var = FakeVariable(False)
+        app.current_track = "sang.mp3"
+        app.current_duration = 120
+        app.is_paused = paused
+        app.play_offset = 0.0
+        app.pending_seek = None
+        app.drag_position = None
+        app.wave_peaks = [0.5]
+        app.wave_progress = 0.0
+        for name in ("play_pause_text", "player_track_var", "player_time_var", "player_total_var",
+                     "status_var", "music_info_var"):
+            setattr(app, name, FakeVariable(""))
+        app.player_buttons = {}
+        app.log = Mock()
+        app.draw_waveform = Mock()
+        app.set_wave_progress = Mock()
+        app.wave_canvas = SimpleNamespace(winfo_width=lambda: 100)
+        app.root = Mock()
+        return app
+
+    def test_vlc_toggle_stops_internal_playback(self):
+        app = self.make_app()
+        app.use_external_player_var.set(True)
+
+        app.on_use_external_player_toggle()
+
+        app.music.stop.assert_called()
+        self.assertFalse(app.player_enabled)
+        self.assertEqual(app.current_track, "")
+        self.assertEqual(app.player_time_var.get(), "VLC direkte")
+
+    def test_vlc_text_is_not_overwritten_by_old_time(self):
+        app = self.make_app()
+        app.use_external_player_var.set(True)
+        app.on_use_external_player_toggle()
+        app.current_duration = 120
+
+        app.update_player_ui()
+
+        self.assertEqual(app.player_time_var.get(), "VLC direkte")
+
+    def test_new_setup_resets_player(self):
+        app = self.make_app()
+
+        app.reset_music()
+
+        app.music.stop.assert_called()
+        self.assertEqual((app.current_track, app.current_duration, app.wave_peaks), ("", 0, []))
+        self.assertEqual(app.player_track_var.get(), "Ingen spor valgt")
+
+    def test_seek_while_paused_waits_until_resume(self):
+        app = self.make_app(paused=True)
+
+        app.seek_to(30)
+
+        app.music.play.assert_not_called()
+        self.assertEqual(app.current_position(), 30)
+        self.assertEqual(app.player_time_var.get(), "0:30")
+
+        app.toggle_play_pause()
+
+        app.music.play.assert_called_once_with(start=30)
+        app.music.unpause.assert_not_called()
+        self.assertFalse(app.is_paused)
+        self.assertIsNone(app.pending_seek)
+
+    def test_failed_seek_plays_from_start(self):
+        app = self.make_app()
+        app.music.play.side_effect = [Exception("ikke støttet"), None]
+        app.music.get_pos.return_value = 0
+
+        app.seek_to(30)
+
+        self.assertEqual(app.music.play.call_args_list[-1], ((),))
+        self.assertEqual(app.play_offset, 0.0)
+        self.assertEqual(app.player_time_var.get(), "0:00")
+        self.assertIn("Spoling støttes ikke", app.status_var.get())
+
+    def test_drag_seeks_once_on_release(self):
+        app = self.make_app()
+
+        for x in (10, 20, 50):
+            app.on_waveform_drag(SimpleNamespace(x=x))
+        app.music.play.assert_not_called()
+        self.assertEqual(app.player_time_var.get(), "1:00")
+
+        app.on_waveform_release(None)
+
+        app.music.play.assert_called_once_with(start=60)
+
+    def test_skip_uses_current_position(self):
+        app = self.make_app()
+        app.play_offset = 40
+
+        app.skip_seconds(-10)
+
+        app.music.play.assert_called_once_with(start=35)
+
+
 if __name__ == "__main__":
     unittest.main()
