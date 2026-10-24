@@ -1137,6 +1137,7 @@ class App:
         # Spoling mens sporet er pauset lagres her og brukes når avspillingen fortsetter.
         self.pending_seek = None
         self.drag_position = None
+        self.preview_job = None
         self.player_enabled = True
         self.wave_peaks = []
         self.wave_cache = {}
@@ -1580,6 +1581,7 @@ class App:
         self.tree.bind("<Button-1>", self.on_tree_checkbox_click)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<Return>", lambda e: self.toggle_play_pause())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self.schedule_waveform_preview())
         self.tree.bind("<space>", lambda e: self.player_key(self.toggle_play_pause))
         self.tree.bind("<Escape>", lambda e: self.player_key(self.stop_playback))
         self.tree.bind("<Left>", lambda e: self.player_key(lambda: self.skip_seconds(-SKIP_SECONDS)))
@@ -2674,22 +2676,25 @@ class App:
         self.play_mp3_file(self.rows[self.tree.index(item_id)].get("MusikkFil", ""))
 
     # -------------------- Avspilling --------------------
-    def get_cached_mp3_path(self, filename):
+    def get_cached_mp3_path(self, filename, quiet=False):
+        # quiet: ingen feilmeldinger (brukes når lydbølgen vises for valgt rad).
+        showinfo = (lambda *a: None) if quiet else messagebox.showinfo
+        showerror = (lambda *a: None) if quiet else messagebox.showerror
         if not filename:
-            messagebox.showinfo("Info", "Ingen lydfil registrert på denne raden.")
+            showinfo("Info", "Ingen lydfil registrert på denne raden.")
             return None
         if not self.music_zip:
-            messagebox.showerror("Feil", "Fant ingen musikk-zip.")
+            showerror("Feil", "Fant ingen musikk-zip.")
             return None
         try:
             with zipfile.ZipFile(self.music_zip, "r") as mz:
                 try:
                     data = mz.read(filename)
                 except KeyError:
-                    messagebox.showerror("Feil", f"Fant ikke lydfil i zip: {filename}")
+                    showerror("Feil", f"Fant ikke lydfil i zip: {filename}")
                     return None
         except Exception as exc:
-            messagebox.showerror("Feil", f"Kunne ikke lese musikk-zip: {exc}")
+            showerror("Feil", f"Kunne ikke lese musikk-zip: {exc}")
             return None
 
         if not self.music_cache_dir:
@@ -2720,7 +2725,7 @@ class App:
         try:
             out_path.write_bytes(data)
         except Exception as exc:
-            messagebox.showerror("Feil", f"Kunne ikke skrive lydfil: {exc}")
+            showerror("Feil", f"Kunne ikke skrive lydfil: {exc}")
             return None
         return out_path
 
@@ -3081,6 +3086,34 @@ class App:
                 self.log(f"Kunne ikke lage lydbølge: {exc}")
             self.wave_cache[key] = (peaks, length)
         return self.wave_cache[key]
+
+    def schedule_waveform_preview(self):
+        # Venter litt, så piltaster gjennom listen ikke leser hver eneste lydfil.
+        if self.preview_job:
+            self.root.after_cancel(self.preview_job)
+        self.preview_job = self.root.after(250, self.preview_selected_waveform)
+
+    def preview_selected_waveform(self):
+        # Viser lydbølgen og lengden for valgt rad når ingenting spilles.
+        self.preview_job = None
+        if self.current_track or not self.player_enabled:
+            return
+        filename = self.get_selected_mp3_filename()
+        row = self.find_row_by_mp3(filename) if filename else None
+        peaks, length = [], 0
+        path = self.get_cached_mp3_path(filename, quiet=True) if filename else None
+        if path and self.ensure_audio_backend():
+            peaks, length = self.load_waveform(path)
+        self.wave_peaks = peaks
+        self.wave_progress = 0.0
+        self.current_duration = (safe_int(row.get("MusikkSek")) if row else 0) or length
+        if row:
+            title = row.get("NavnFraIsonen") or row.get("PrintName") or ""
+            self.player_track_var.set(f"{title} - {filename}".strip(" -"))
+        else:
+            self.player_track_var.set("Ingen lydfil på valgt rad")
+        self.draw_waveform()
+        self.show_player_time()
 
     def show_waveform(self, path, filename):
         if self.current_track != filename or self.external_playback:

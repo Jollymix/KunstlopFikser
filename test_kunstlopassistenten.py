@@ -572,6 +572,47 @@ class PlayerTests(unittest.TestCase):
 
         app.music.play.assert_called_once_with(start=60)
 
+    def make_preview_app(self):
+        app = self.make_app()
+        app.current_track = ""
+        app.current_duration = 0
+        app.items = [{"MusikkFil": "sang.mp3", "MusikkSek": "95", "NavnFraIsonen": "Anna Berg"}]
+        app.get_selected_mp3_filename = Mock(return_value="sang.mp3")
+        app.get_cached_mp3_path = Mock(return_value=Path("sang.mp3"))
+        app.ensure_audio_backend = Mock(return_value=True)
+        app.load_waveform = Mock(return_value=([0.2, 1.0], 96.0))
+        return app
+
+    def test_selecting_row_shows_waveform(self):
+        app = self.make_preview_app()
+
+        app.preview_selected_waveform()
+
+        app.get_cached_mp3_path.assert_called_once_with("sang.mp3", quiet=True)
+        self.assertEqual(app.wave_peaks, [0.2, 1.0])
+        self.assertEqual(app.player_total_var.get(), "1:35")
+        self.assertEqual(app.player_track_var.get(), "Anna Berg - sang.mp3")
+        app.music.play.assert_not_called()
+
+    def test_selecting_row_while_playing_keeps_current_track(self):
+        app = self.make_preview_app()
+        app.current_track = "annen.mp3"
+
+        app.preview_selected_waveform()
+
+        app.load_waveform.assert_not_called()
+
+    def test_quiet_cache_lookup_shows_no_dialogs(self):
+        app = App.__new__(App)
+        app.music_zip = None
+
+        with patch("kunstlopassistenten.messagebox") as messagebox:
+            self.assertIsNone(app.get_cached_mp3_path("sang.mp3", quiet=True))
+            self.assertIsNone(app.get_cached_mp3_path("", quiet=True))
+
+        messagebox.showerror.assert_not_called()
+        messagebox.showinfo.assert_not_called()
+
     def test_skip_uses_current_position(self):
         app = self.make_app()
         app.play_offset = 40
