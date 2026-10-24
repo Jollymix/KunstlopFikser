@@ -1182,6 +1182,8 @@ class App:
         self.update_title()
         self.update_player_ui()
         self.update_clock()
+        # Lydmotoren startes når vinduet er tegnet, så første radvalg og avspilling ikke venter på den.
+        self.root.after(200, self.ensure_audio_backend)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     @property
