@@ -1393,6 +1393,7 @@ class App:
         self.wave_results = queue.Queue()
         self.play_pause_text = tk.StringVar(value="Spill")
         self.use_external_player_var = tk.BooleanVar(value=False)
+        self.competition_mode = False
 
         self._init_fonts()
         self._init_style()
@@ -1480,7 +1481,8 @@ class App:
         s.configure("TNotebook.Tab", background=BG, foreground=TEXT_DIM, padding=(16, 7),
                     bordercolor=BG, lightcolor=BG, darkcolor=BG, font=f["body"])
         # clam-temaet gir fanene lyse kanter via lightcolor; de settes til fanens egen farge.
-        s.map("TNotebook.Tab", background=[("selected", PANEL)], foreground=[("selected", TEXT)],
+        s.map("TNotebook.Tab", background=[("selected", PANEL)],
+              foreground=[("disabled", TEXT_DISABLED), ("selected", TEXT)],
               lightcolor=[("selected", PANEL), ("", BG)])
 
         s.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=TEXT,
@@ -1551,11 +1553,16 @@ class App:
             font=self.fonts["body"],
         )
 
+        # Menyknappene dimmes i stevnemodus.
+        self.menu_buttons = []
+
         def add_menu(label):
             button = tk.Menubutton(menubar, text=label, underline=0, bg=BG, fg=TEXT,
                                    activebackground=BUTTON_HOVER, activeforeground=TEXT, relief="flat",
-                                   bd=0, padx=10, pady=4, font=self.fonts["body"])
+                                   bd=0, padx=10, pady=4, font=self.fonts["body"],
+                                   disabledforeground=TEXT_DISABLED)
             button.pack(side="left")
+            self.menu_buttons.append(button)
             menu = tk.Menu(button, **self.menu_options)
             button.configure(menu=menu)
             return menu
@@ -1593,7 +1600,7 @@ class App:
         menu_help = add_menu("Hjelp")
         menu_help.add_command(label="Om", command=self.show_about)
         self.root.bind_all("<Control-s>", lambda e: self.save_setup())
-        self.root.bind_all("<Control-o>", lambda e: self.open_setup())
+        self.root.bind_all("<Control-o>", lambda e: None if self.competition_mode else self.open_setup())
 
     def _build(self):
         r = self.root
@@ -1609,6 +1616,9 @@ class App:
             value="Hent deltakere fra Fil-menyen, eller legg inn utøvere manuelt."
         )
         ttk.Label(title_box, textvariable=self.status_var, style="Dim.TLabel").pack(anchor="w")
+        self.mode_button = ttk.Button(top, text="Stevnemodus", style="Accent.TButton",
+                                      command=lambda: self.set_competition_mode(not self.competition_mode))
+        self.mode_button.pack(side="right", anchor="center")
 
         log_panel = ttk.Frame(r, style="Panel.TFrame", padding=(14, 8))
         log_panel.pack(side="bottom", fill="x", padx=18, pady=(0, 18))
@@ -1627,8 +1637,30 @@ class App:
         body.pack(fill="both", expand=True)
         nb = ttk.Notebook(body)
         nb.pack(fill="both", expand=True)
+        self.notebook = nb
         self._tab_schedule(nb)
         self._tab_music(nb)
+
+    def set_competition_mode(self, on):
+        # Stevnemodus: bare klokke, stevneliste, avspiller og logg. Menyer og andre faner dimmes,
+        # og knappene over listen skjules, så ingenting endres ved et uhell under stevnet.
+        self.competition_mode = on
+        state = "disabled" if on else "normal"
+        for button in self.menu_buttons:
+            button.configure(state=state)
+        for tab in self.notebook.tabs():
+            if tab != str(self.music_tab):
+                self.notebook.tab(tab, state=state)
+        if on:
+            self.notebook.select(self.music_tab)
+            self.music_bar.grid_remove()
+            self.music_hint.grid_remove()
+            self.tree.focus_set()
+        else:
+            self.music_bar.grid()
+            self.music_hint.grid()
+        self.mode_button.configure(text="Redigeringsmodus" if on else "Stevnemodus")
+        self.log("Stevnemodus er på." if on else "Redigeringsmodus er på.")
 
     def _panel(self, nb, title):
         frame = ttk.Frame(nb, style="Panel.TFrame", padding=20)
@@ -1797,6 +1829,7 @@ class App:
     # -------------------- Fane: Stevne --------------------
     def _tab_music(self, nb):
         p = self._panel(nb, "Stevne")
+        self.music_tab = p
         p.columnconfigure(0, weight=1)
         p.rowconfigure(2, weight=1)
 
@@ -1817,6 +1850,7 @@ class App:
 
         bar = ttk.Frame(p, style="Panel.TFrame")
         bar.grid(row=1, column=0, sticky="we", pady=(0, 12))
+        self.music_bar = bar
         ttk.Button(bar, text="Hent musikk (zipfil fra nsfcompetition)…", style="Accent.TButton",
                    command=self.choose_music_zip).pack(side="left")
         ttk.Button(bar, text="Hent musikk fra mappe…", command=self.choose_music_folder).pack(
@@ -1879,10 +1913,12 @@ class App:
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
-        ttk.Label(p, text="Dobbeltklikk eller Enter spiller lydfilen. Mellomrom: spill/pause, Esc: stopp, "
-                          f"←/→: spol {SKIP_SECONDS} s. Klikk i «Løp gjennomført» for å krysse av. "
-                          "Høyreklikk for å velge lydfil.",
-                  style="PanelDim.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.music_hint = ttk.Label(
+            p, text="Dobbeltklikk eller Enter spiller lydfilen. Mellomrom: spill/pause, Esc: stopp, "
+                    f"←/→: spol {SKIP_SECONDS} s. Klikk i «Løp gjennomført» for å krysse av. "
+                    "Høyreklikk for å velge lydfil.",
+            style="PanelDim.TLabel")
+        self.music_hint.grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         self.table_columns = tuple(columns)
         self.table_column_vars = {}
@@ -3072,7 +3108,8 @@ class App:
 
     def on_tree_right_click(self, event):
         item_id = self.tree.identify_row(event.y)
-        if not item_id:
+        # Lydfil kan ikke byttes i stevnemodus.
+        if not item_id or self.competition_mode:
             return
         self.tree.selection_set(item_id)
         self.tree.focus(item_id)

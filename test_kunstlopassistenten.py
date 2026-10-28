@@ -383,6 +383,28 @@ class RegressionTests(unittest.TestCase):
 
         self.assertIsNone(app.selected_item())
 
+    def test_competition_mode_dims_menus_and_other_tabs(self):
+        app = App.__new__(App)
+        app.log = Mock()
+        app.menu_buttons = [Mock(), Mock()]
+        app.music_tab = "stevne"
+        app.notebook = Mock(tabs=Mock(return_value=("tidsplan", "stevne")))
+        app.music_bar, app.music_hint, app.tree, app.mode_button = Mock(), Mock(), Mock(), Mock()
+
+        app.set_competition_mode(True)
+
+        app.menu_buttons[0].configure.assert_called_with(state="disabled")
+        app.notebook.tab.assert_called_once_with("tidsplan", state="disabled")
+        app.notebook.select.assert_called_once_with("stevne")
+        app.music_bar.grid_remove.assert_called_once()
+        app.mode_button.configure.assert_called_with(text="Redigeringsmodus")
+
+        app.set_competition_mode(False)
+
+        app.notebook.tab.assert_called_with("tidsplan", state="normal")
+        app.music_bar.grid.assert_called_once()
+        app.mode_button.configure.assert_called_with(text="Stevnemodus")
+
     def test_single_actions_use_focused_row_in_multi_selection(self):
         app = App.__new__(App)
         app.items = [self.runner("A"), self.runner("B"), self.runner("C")]
