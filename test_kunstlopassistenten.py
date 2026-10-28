@@ -378,10 +378,43 @@ class RegressionTests(unittest.TestCase):
 
     def test_stale_selection_after_list_is_replaced(self):
         app = App.__new__(App)
-        app.schedule_tree = SimpleNamespace(selection=lambda: ("i5",))
+        app.schedule_tree = SimpleNamespace(selection=lambda: ("i5",), focus=lambda: "i5")
         app.items = [self.runner("A")]
 
         self.assertIsNone(app.selected_item())
+
+    def test_single_actions_use_focused_row_in_multi_selection(self):
+        app = App.__new__(App)
+        app.items = [self.runner("A"), self.runner("B"), self.runner("C")]
+        app.schedule_tree = SimpleNamespace(selection=lambda: ("i0", "i2"), focus=lambda: "i2")
+
+        self.assertIs(app.selected_item(), app.items[2])
+        self.assertEqual([r["GivenName"] for r in app.selected_rows()], ["A", "C"])
+
+    def test_short_program_added_later_creates_new_run(self):
+        app = App.__new__(App)
+        app.log = Mock()
+        row = self.runner("Anna")
+        app.items = split_segments([row])
+        app.music_index = {"FS.mp3": parse_music_path("Anna_Test_FS.mp3")}
+        app.apply_music_segments()
+        self.assertEqual([(r["Segment"], r.get("Program")) for r in app.rows], [("FS", "")])
+
+        app.music_index["SP.mp3"] = parse_music_path("Anna_Test_SP.mp3")
+        app.apply_music_segments()
+
+        self.assertEqual([(r["Segment"], r.get("Program")) for r in app.rows],
+                         [("SP", "Kortprogram"), ("FS", "Friløp")])
+
+    def test_imported_ovelse_is_not_changed_by_music_files(self):
+        app = App.__new__(App)
+        app.log = Mock()
+        app.items = split_segments([self.runner("Anna", Ovelse="Friløp")])
+        app.music_index = {"SP.mp3": parse_music_path("Anna_Test_SP.mp3")}
+
+        app.apply_music_segments()
+
+        self.assertEqual([r["Segment"] for r in app.rows], ["FS"])
 
     def test_ambiguous_music_match_is_marked_uncertain(self):
         index = {f: parse_music_path(f) for f in (
@@ -543,6 +576,37 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(rows[2]["MusikkFil"], "")
             self.assertEqual((imported["settings"], rows[0]["LopLengde"]), ({"start": "08:15"}, 150))
             self.assertEqual(items[1]["MusikkFil"], str(song))
+
+    def test_setup_package_keeps_files_that_differ_only_in_case(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            items = [self.runner("A", MusikkFil="x/Sang.mp3"), self.runner("B", MusikkFil="y/sang.mp3")]
+            music = {"x/Sang.mp3": b"ID3-a", "y/sang.mp3": b"ID3-b"}
+
+            export_setup_package({"type": "kunstlopassistenten-oppsett", "items": items}, music.get,
+                                 temp / "pakke.zip")
+            imported = extract_setup_package(temp / "pakke.zip", temp / "ny")
+
+            self.assertEqual([Path(r["MusikkFil"]).read_bytes() for r in imported["items"]],
+                             [b"ID3-a", b"ID3-b"])
+
+    def test_import_that_cannot_be_saved_is_not_reported_as_done(self):
+        app = App.__new__(App)
+        app.confirm_discard = Mock(return_value=True)
+        app.apply_setup = Mock()
+        app.save_setup = Mock(return_value=False)
+        app.update_title, app.log, app.show_folder_link = Mock(), Mock(), Mock()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package = Path(temp_dir) / "pakke.zip"
+            export_setup_package({"type": "kunstlopassistenten-oppsett", "items": []}, lambda f: None, package)
+            with patch("kunstlopassistenten.filedialog.askopenfilename", return_value=str(package)), \
+                    patch("kunstlopassistenten.Path.home", return_value=Path(temp_dir)), \
+                    patch("kunstlopassistenten.messagebox.showwarning") as warning:
+                app.import_package()
+
+        warning.assert_called_once()
+        app.show_folder_link.assert_not_called()
+        self.assertTrue(app.dirty)
 
     def test_setup_package_cannot_write_outside_folder(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -813,6 +877,18 @@ class PlayerTests(unittest.TestCase):
 
         self.assertIn("--start-time=47.5", popen.call_args.args[0])
         app.music.play.assert_not_called()
+
+    def test_without_vlc_position_does_not_start_default_player_from_beginning(self):
+        app = self.make_preview_app()
+        app.preview_selected_waveform()
+        app.music.load.side_effect = Exception("ukjent format")
+
+        with patch("kunstlopassistenten.find_vlc_executable", return_value=None), \
+                patch("kunstlopassistenten.os.startfile", create=True) as startfile:
+            app.on_waveform_drag(SimpleNamespace(x=50))
+            app.on_waveform_release(None)
+
+        startfile.assert_not_called()
 
     def test_stopped_track_can_be_restarted_from_waveform(self):
         app = self.make_app()

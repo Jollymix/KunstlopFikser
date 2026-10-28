@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 import subprocess
 import tempfile
 from io import BytesIO
-import hashlib
 import random
 import re
 import json
@@ -512,7 +511,8 @@ def export_setup_package(data, read_music, out_path):
     # når filen ikke finnes. Lydfilene legges i musikk/ og radene peker dit. Returnerer løp uten lydfil.
     out_path = Path(out_path)
     items = [dict(item) for item in data["items"]]
-    names, missing = {}, []
+    # taken: brukte navn i små bokstaver, siden Windows ikke skiller Sang.mp3 og sang.mp3.
+    names, missing, taken = {}, [], set()
     tmp_path = out_path.with_name(out_path.name + ".tmp")
     try:
         with zipfile.ZipFile(tmp_path, "w") as package:
@@ -526,9 +526,10 @@ def export_setup_package(data, read_music, out_path):
                     if music is not None:
                         stem, suffix = os.path.splitext(music_file_name(source))
                         name, n = f"{PACKAGE_MUSIC_DIR}/{stem}{suffix}", 1
-                        while name in names.values():
+                        while name.lower() in taken:
                             n += 1
                             name = f"{PACKAGE_MUSIC_DIR}/{stem}_{n}{suffix}"
+                        taken.add(name.lower())
                         package.writestr(name, music)
                         names[source] = name
                 if names[source] is None:
@@ -563,6 +564,9 @@ def extract_setup_package(package_path, target_dir):
             raise ValueError(error)
         music_dir = target_dir / PACKAGE_MUSIC_DIR
         music_dir.mkdir(parents=True, exist_ok=True)
+        # {navn i pakken: utpakket fil}. used har filnavn i små bokstaver, så to navn som bare skiller
+        # seg i store/små bokstaver ikke overskriver hverandre på Windows.
+        extracted, used = {}, set()
         for item in data["items"]:
             name = item.get("MusikkFil")
             if is_marker(item) or not name:
@@ -573,13 +577,20 @@ def extract_setup_package(package_path, target_dir):
                     or any(c in parts[1] for c in ':\\'):
                 item["MusikkFil"] = ""
                 continue
-            dest = music_dir / parts[1]
-            try:
-                dest.write_bytes(package.read(name))
-            except KeyError:
-                item["MusikkFil"] = ""
-                continue
-            item["MusikkFil"] = str(dest.resolve())
+            if name not in extracted:
+                stem, suffix = os.path.splitext(parts[1])
+                dest_name, n = parts[1], 1
+                while dest_name.lower() in used:
+                    n += 1
+                    dest_name = f"{stem}_{n}{suffix}"
+                used.add(dest_name.lower())
+                dest = music_dir / dest_name
+                try:
+                    dest.write_bytes(package.read(name))
+                    extracted[name] = str(dest.resolve())
+                except KeyError:
+                    extracted[name] = ""
+            item["MusikkFil"] = extracted[name]
     data["music_folder"] = str(music_dir.resolve())
     return data
 
@@ -2097,8 +2108,11 @@ class App:
         selected = self.schedule_tree.selection()
         if not selected:
             return None
+        # Ved flervalg gjelder enkelthandlinger raden med fokus (f.eks. den som ble høyreklikket).
+        focus = self.schedule_tree.focus()
+        iid = focus if focus in selected else selected[0]
         # Valget kan være igjen fra før listen ble byttet ut eller kortet ned.
-        index = int(selected[0][1:])
+        index = int(iid[1:])
         return self.items[index] if index < len(self.items) else None
 
     def refresh_schedule(self, select=None):
@@ -2537,10 +2551,17 @@ class App:
             return
         for name in missing:
             self.log(f"ADVARSEL: Fant ikke lydfilen til {name}; den er ikke med i pakken.")
+        no_music = [run_name(r) for r in self.active_rows() if not r.get("MusikkFil")]
+        for name in no_music:
+            self.log(f"ADVARSEL: {name} har ingen lydfil.")
         self.log(f"Eksportert oppsett med musikk: {path}")
         text = f"Oppsettet og musikken er lagret i:\n{path}"
         if missing:
-            text += f"\n\n{len(missing)} løp mangler lydfil i pakken (se loggen)."
+            text += f"\n\n{len(missing)} løp har en lydfil som ikke ble funnet, og den er ikke med i pakken."
+        if no_music:
+            text += f"\n\n{len(no_music)} løp har ingen lydfil."
+        if missing or no_music:
+            text += "\n\nSe loggen for navn."
         messagebox.showinfo("Eksport ferdig", text)
 
     def import_package(self):
@@ -2567,7 +2588,16 @@ class App:
             return
         self.apply_setup(data, target / PACKAGE_SETUP_NAME)
         # Lagres med en gang, så Ctrl+S og «Åpne oppsett» virker på den nye PC-en.
-        self.save_setup()
+        if not self.save_setup():
+            self.dirty = True
+            self.update_title()
+            self.log(f"Musikken er pakket ut i {target}, men oppsettet ble ikke lagret.")
+            messagebox.showwarning(
+                "Importen er ikke fullført",
+                f"Musikken er pakket ut i:\n{target}\n\nOppsettet er åpnet, men ble ikke lagret. "
+                "Bruk «Lagre oppsett som…» for å lagre det.",
+            )
+            return
         self.log(f"Importert oppsett med musikk til: {target}")
         self.show_folder_link(target, "Import ferdig", "Oppsettet og musikken er lagt i:")
 
@@ -2952,12 +2982,14 @@ class App:
 
     def apply_music_segments(self):
         # Utøvere uten øvelse (Spond) får program fra lydfilene; med både _SP og _FS blir det to løp.
+        # OvelseFraMusikk: øvelsen er lest av lydfilene og leses på nytt, f.eks. når SP kommer senere.
         for row in self.rows:
-            if row.get("Ovelse") or row.get("Program") or row.get("MusikkManuell"):
+            from_music = row.get("OvelseFraMusikk")
+            if (row.get("Ovelse") and not from_music) or row.get("Program") or row.get("MusikkManuell"):
                 continue
             ovelse = ovelse_from_music(row, self.music_index)
-            if ovelse:
-                row["Ovelse"] = ovelse
+            if ovelse and ovelse != row.get("Ovelse"):
+                row["Ovelse"], row["OvelseFraMusikk"] = ovelse, True
                 row["Segment"] = segments_for(ovelse)[0]
         added = add_missing_segments(self.items)
         if added:
@@ -3013,6 +3045,7 @@ class App:
         if parsed and not row.get("Program"):
             # Bare ett program: filnavnet (_SP/_FS) bestemmer programmet.
             row["Segment"], row["Ovelse"] = parsed["segment"], SEGMENT_NAMES[parsed["segment"]]
+            row["OvelseFraMusikk"] = True
         self.set_row_music(row, str(path), info, seconds, "Valgt manuelt")
         row["MusikkManuell"] = True
         self.log(f"Lydfil for {run_name(row)}: {path}")
@@ -3253,17 +3286,6 @@ class App:
         if not self.music_zip:
             showerror("Feil", "Fant ingen musikk-zip.")
             return None
-        try:
-            with zipfile.ZipFile(self.music_zip, "r") as mz:
-                try:
-                    data = mz.read(filename)
-                except KeyError:
-                    showerror("Feil", f"Fant ikke lydfil i zip: {filename}")
-                    return None
-        except Exception as exc:
-            showerror("Feil", f"Kunne ikke lese musikk-zip: {exc}")
-            return None
-
         if not self.music_cache_dir:
             base = Path(tempfile.gettempdir()) / "fms_gui_music_cache"
             base.mkdir(parents=True, exist_ok=True)
@@ -3271,24 +3293,38 @@ class App:
             self.music_cache_dir = base / safe_zip
             self.music_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        audio_info = self.music_file_info.get(filename)
-        if not audio_info:
-            audio_format, detected_suffix = detect_audio_format(data)
-            audio_info = {
-                "format": audio_format,
-                "suffix": detected_suffix or Path(filename).suffix.lower(),
-            }
-            self.music_file_info[filename] = audio_info
-
-        safe_stem = sanitize_filename(Path(filename).stem)
-        content_hash = hashlib.sha256(data).hexdigest()[:12]
-        safe_name = f"{safe_stem}_{content_hash}{audio_info.get('suffix', '')}"
-        out_path = self.music_cache_dir / safe_name
+        # Hurtiglageret navngis med CRC og størrelse fra zip-katalogen, så en fil som allerede er
+        # pakket ut gjenbrukes uten at lyddataene leses. Endret innhold gir ny CRC og ny fil.
         try:
-            if out_path.is_file() and out_path.stat().st_size == len(data):
-                return out_path
-        except OSError:
-            pass
+            with zipfile.ZipFile(self.music_zip, "r") as mz:
+                try:
+                    entry = mz.getinfo(filename)
+                except KeyError:
+                    showerror("Feil", f"Fant ikke lydfil i zip: {filename}")
+                    return None
+                data = None
+                audio_info = self.music_file_info.get(filename)
+                if not audio_info:
+                    data = mz.read(entry)
+                    audio_format, detected_suffix = detect_audio_format(data)
+                    audio_info = {
+                        "format": audio_format,
+                        "suffix": detected_suffix or Path(filename).suffix.lower(),
+                    }
+                    self.music_file_info[filename] = audio_info
+                safe_stem = sanitize_filename(Path(filename).stem)
+                safe_name = f"{safe_stem}_{entry.CRC:08x}{audio_info.get('suffix', '')}"
+                out_path = self.music_cache_dir / safe_name
+                try:
+                    if out_path.is_file() and out_path.stat().st_size == entry.file_size:
+                        return out_path
+                except OSError:
+                    pass
+                if data is None:
+                    data = mz.read(entry)
+        except Exception as exc:
+            showerror("Feil", f"Kunne ikke lese musikk-zip: {exc}")
+            return None
         try:
             out_path.write_bytes(data)
         except Exception as exc:
@@ -3370,9 +3406,12 @@ class App:
             except Exception as exc:
                 self.log(f"Kunne ikke starte VLC: {exc}")
 
+        if fallback_to_default and start:
+            # Windows-standardspilleren kan ikke starte midt i sporet; starter ikke noe operatøren ikke ba om.
+            self.log(f"Kan ikke starte {filename} fra {format_duration(start)} uten VLC.")
+            self.status_var.set("Avspilling fra valgt posisjon krever VLC. Trykk play for å spille fra start.")
+            return False
         if fallback_to_default:
-            if start:
-                self.log("Windows-standardspilleren kan ikke starte midt i sporet. Starter fra begynnelsen.")
             try:
                 os.startfile(str(path))
                 self.set_external_playback_status(filename, "Ekstern avspiller")
