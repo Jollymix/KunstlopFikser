@@ -48,6 +48,14 @@ PACKAGE_FILETYPES = [("Oppsettpakke", "*.zip"), ("Alle filer", "*.*")]
 PACKAGE_SETUP_NAME = "oppsett.json"
 PACKAGE_MUSIC_DIR = "musikk"
 
+# Klasser i single fra Norges Skøyteforbund, «Spesielle bestemmelser for kunstløp» pr. 30.08.2026, § 16.2.
+# Rekkefølgen er nivå fra lavest til høyest og brukes av «Sorter etter klasse».
+SKATING_CLASSES = [
+    "Oppvisning", "Artistic", "Pre-Basic", "Basic", "Cubs u/13", "Cubs o/13", "Cubs", "Springs",
+    "Intermediate Novice", "Advanced Novice", "Advanced Novice A", "Junior", "Junior A", "Senior", "Senior A",
+    "Veteran Artistic", "Veteran Bronze", "Veteran Silver", "Veteran Gold", "Veteran Masters",
+]
+
 # Programmene i musikktjenesten: mappenavn/filendelse i musikk-zip -> navn.
 SEGMENT_NAMES = {"SP": "Kortprogram", "FS": "Friløp"}
 # Status fra music-status.csv i musikk-zip.
@@ -206,6 +214,20 @@ def ovelse_from_music(row, music_index):
     if found == {"SP", "FS"}:
         return "Kortprogram+Friløp"
     return SEGMENT_NAMES[found.pop()] if found else ""
+
+
+def class_sort_key(klasse):
+    # Plass i SKATING_CLASSES. Klasser fra isonen kan ha mer bak («Junior Kvinner»), så lengste kjente
+    # klassenavn i starten av teksten avgjør. Ukjente klasser kommer etter, uten klasse helt sist.
+    text = normalize_text(klasse)
+    if not text:
+        return len(SKATING_CLASSES) + 1, ""
+    best = None
+    for k, name in enumerate(SKATING_CLASSES):
+        known = normalize_text(name)
+        if (text == known or text.startswith(known + " ")) and (best is None or len(known) > best[1]):
+            best = k, len(known)
+    return (best[0], text) if best else (len(SKATING_CLASSES), text)
 
 
 def music_file_name(filename):
@@ -1020,6 +1042,7 @@ def build_startliste(
                 "custom_length": bool(row.get("LopLengde")),
                 "nr": nr,
                 "navn": navn,
+                "klasse": row.get("Klasse", "") if kind == "run" else "",
                 "klubb": klubb,
                 "row": row,
             }
@@ -1059,7 +1082,7 @@ def generate_startliste_excel(entries, out_path, title, log):
         ws.append([title])
         ws.append([])
         headers = (["Nr.", "Start", "", "Slutt", "Lengde på løp"]
-                   + (["Sammenlagt tidsforbruk"] if with_duration else []) + ["Navn", "Klubb"])
+                   + (["Sammenlagt tidsforbruk"] if with_duration else []) + ["Navn", "Klasse", "Klubb"])
         ws.append(headers)
         for cell in ws[3]:
             cell.font = bold
@@ -1074,13 +1097,13 @@ def generate_startliste_excel(entries, out_path, title, log):
                     start = f"ca. {start}"
             duration = [entry["duration"]] if with_duration else []
             ws.append([entry["nr"], start, "-", entry["end"], entry["run_length"]] + duration
-                      + [entry["navn"], entry["klubb"]])
+                      + [entry["navn"], entry["klasse"], entry["klubb"]])
             if entry["is_group"]:
                 for cell in ws[ws.max_row]:
                     cell.font = bold
                     cell.fill = group_fill
 
-        widths = [6, 10, 3, 10, 14] + ([22] if with_duration else []) + [38, 16]
+        widths = [6, 10, 3, 10, 14] + ([22] if with_duration else []) + [38, 18, 16]
         for idx, width in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = width
         ws.append([])
@@ -1135,13 +1158,14 @@ def generate_startliste_pdf(entries, out_path, title, log):
     # De lange overskriftene brytes over to linjer.
     head_style = ParagraphStyle("HeadCell", fontName=font_name, fontSize=11, leading=12, alignment=1)
     data = [["Nr.", "Start", "", "Slutt", Paragraph("Lengde på løp", head_style),
-             Paragraph("Sammenlagt tidsforbruk", head_style), "Navn", "Klubb"]]
+             Paragraph("Sammenlagt tidsforbruk", head_style), "Navn", "Klasse", "Klubb"]]
     for entry in entries:
         # Paragraph tolker tekst som markup, så & og < i navn må escapes.
         name_cell = Paragraph(xml_escape(entry["navn"]), body_style)
+        class_cell = Paragraph(xml_escape(entry["klasse"]), body_style)
         club_cell = Paragraph(xml_escape(entry["klubb"]), body_style)
         data.append([entry["nr"], entry["start"], "-", entry["end"], entry["run_length"], entry["duration"],
-                     name_cell, club_cell])
+                     name_cell, class_cell, club_cell])
 
     doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
@@ -1155,7 +1179,7 @@ def generate_startliste_pdf(entries, out_path, title, log):
     generated_ts = format_generated_ts()
     story = [Paragraph(xml_escape(title), title_style), Spacer(1, 8)]
 
-    col_widths = [26, 52, 10, 52, 54, 74, 145, 110]
+    col_widths = [26, 48, 10, 48, 50, 62, 120, 70, 89]
     table = Table(data, repeatRows=1, colWidths=col_widths)
     style_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#ADADAD")),
@@ -1500,6 +1524,7 @@ class App:
         self.water_count_var.trace_add("write", lambda *_: self.on_layout_setting_change(regroup=False))
         self.new_name_var = tk.StringVar()
         self.new_club_var = tk.StringVar()
+        self.new_class_var = tk.StringVar()
         self.var_pdf = tk.BooleanVar(value=False)
         self.var_excel = tk.BooleanVar(value=True)
         self.var_html = tk.BooleanVar(value=True)
@@ -1659,14 +1684,20 @@ class App:
         ttk.Label(form, text="Klubb", style="Panel.TLabel").grid(row=row + 3, column=0, sticky="w", pady=3)
         club_entry = ttk.Entry(form, textvariable=self.new_club_var, width=22, font=self.fonts["body"])
         club_entry.grid(row=row + 3, column=1, sticky="w", pady=3)
-        for entry in (name_entry, club_entry):
+        ttk.Label(form, text="Klasse", style="Panel.TLabel").grid(row=row + 4, column=0, sticky="w", pady=3)
+        self.class_entry = ttk.Combobox(form, textvariable=self.new_class_var, values=SKATING_CLASSES,
+                                        width=20, font=self.fonts["body"],
+                                        postcommand=lambda: self.class_entry.configure(
+                                            values=self.class_choices()))
+        self.class_entry.grid(row=row + 4, column=1, sticky="w", pady=3)
+        for entry in (name_entry, club_entry, self.class_entry):
             entry.bind("<Return>", lambda e: self.add_runner())
         self.name_entry = name_entry
         ttk.Button(form, text="Legg til", command=self.add_runner).grid(
-            row=row + 4, column=1, sticky="w", pady=(6, 0))
+            row=row + 5, column=1, sticky="w", pady=(6, 0))
 
         actions = ttk.Frame(form, style="Panel.TFrame")
-        actions.grid(row=row + 5, column=0, columnspan=2, sticky="we", pady=(24, 0))
+        actions.grid(row=row + 6, column=0, columnspan=2, sticky="we", pady=(24, 0))
         # Import, åpne og lagre ligger i Fil-menyen, så knappene ikke klippes på små skjermer.
         ttk.Button(actions, text="Lagre startliste (Excel + PDF)", style="Accent.TButton",
                    command=self.generate_startliste).pack(fill="x")
@@ -1683,13 +1714,16 @@ class App:
             "lengde": ("Lengde på løp", 110, "center"),
             "tid": ("Sammenlagt tidsforbruk", 170, "center"),
             "navn": ("Navn", 260, "w"),
+            "klasse": ("Klasse", 140, "w"),
             "klubb": ("Klubb", 200, "w"),
         }
+        # Flere rader kan merkes (Ctrl/Shift+klikk) for å sette klasse på alle; dra flytter én rad.
         self.schedule_tree = ttk.Treeview(table, columns=tuple(columns), show="headings",
-                                          selectmode="browse")
+                                          selectmode="extended")
         for col, (text, width, anchor) in columns.items():
             self.schedule_tree.heading(col, text=text, anchor=anchor)
-            self.schedule_tree.column(col, width=width, anchor=anchor, stretch=col in ("navn", "klubb"))
+            self.schedule_tree.column(col, width=width, anchor=anchor,
+                                      stretch=col in ("navn", "klasse", "klubb"))
         self.schedule_tree.tag_configure("warmup", background=GROUP_BG, font=self.fonts["bold"])
         self.schedule_tree.tag_configure("pause", background=GROUP_BG, foreground=WARN,
                                          font=self.fonts["bold"])
@@ -1711,6 +1745,10 @@ class App:
                                        command=lambda: self.choose_row_music(self.selected_item()))
         self.schedule_menu.add_command(label="Fjern valgt lydfil",
                                        command=lambda: self.clear_row_music(self.selected_item()))
+        self.schedule_menu.add_separator()
+        # Fylles når menyen åpnes, så klasser fra isonen også er med.
+        self.class_menu = tk.Menu(self.schedule_menu, **self.menu_options)
+        self.schedule_menu.add_cascade(label="Sett klasse", menu=self.class_menu)
         self.schedule_tree.bind("<Alt-Up>", lambda e: self.move_selected(-1) or "break")
         self.schedule_tree.bind("<Alt-Down>", lambda e: self.move_selected(1) or "break")
         self.schedule_tree.bind("<ButtonPress-1>", self.on_drag_start)
@@ -1736,11 +1774,13 @@ class App:
             ("Randomiser", self.shuffle_rows, 16),
             ("Sorter fornavn", self.sort_by_given, 4),
             ("Sorter etternavn", self.sort_by_family, 4),
+            ("Sorter etter klasse", self.sort_by_class, 4),
             ("Eksporter til Excel", self.export_excel, 16),
         ):
             ttk.Button(side, text=text, command=command, width=16).pack(fill="x", pady=(gap, 0))
         ttk.Label(side, text="Dra rader med musen,\neller bruk Alt+↑/↓.\nDobbeltklikk redigerer.\n"
-                             "Høyreklikk en utøver for\nå endre lengde på løp.",
+                             "Høyreklikk en utøver for\nå endre lengde på løp\neller sette klasse.\n"
+                             "Ctrl/Shift+klikk merker\nflere for å sette klasse.",
                   style="PanelDim.TLabel", justify="left").pack(anchor="w", pady=(16, 0))
 
     # -------------------- Fane: Stevne --------------------
@@ -2106,7 +2146,7 @@ class App:
             run_length = entry["run_length"] + (" *" if entry["custom_length"] else "")
             tree.insert("", "end", iid=iid, tags=tags, values=(
                 entry["nr"], entry["start"], "-", entry["end"], run_length, entry["duration"],
-                entry["navn"], entry["klubb"],
+                entry["navn"], entry["klasse"], entry["klubb"],
             ))
         if select_iid:
             tree.selection_set(select_iid)
@@ -2141,6 +2181,7 @@ class App:
             self.name_entry.focus_set()
             return
         row = new_participant(given, family, self.new_club_var.get())
+        row["Klasse"] = self.new_class_var.get().strip()
         # Utøveren havner i siste gruppe. Finnes ingen grupper ennå, lages de på nytt.
         self.items.append(row)
         if self.group_count() and not any(i.get("Kind") == "warmup" for i in self.items):
@@ -2163,6 +2204,11 @@ class App:
                                       initialvalue=row.get("Organisation", ""), parent=self.root)
         if club is None:
             return
+        klasse = simpledialog.askstring("Rediger utøver", "Klasse (f.eks. Oppvisning, Basic, Springs):",
+                                        initialvalue=row.get("Klasse", ""), parent=self.root)
+        if klasse is None:
+            return
+        row["Klasse"] = klasse.strip()
         given, family = split_name(name.strip())
         if (given, family) != (row.get("GivenName"), row.get("FamilyName")) and not row.get("MusikkManuell"):
             row["MusikkFil"] = ""
@@ -2177,17 +2223,59 @@ class App:
         iid = self.schedule_tree.identify_row(event.y)
         if not iid:
             return
-        self.schedule_tree.selection_set(iid)
+        # Høyreklikk i et flervalg beholder valget, så klassen kan settes på alle.
+        if iid not in self.schedule_tree.selection():
+            self.schedule_tree.selection_set(iid)
         self.schedule_tree.focus(iid)
-        row = self.selected_item()
+        row = self.items[int(iid[1:])] if int(iid[1:]) < len(self.items) else None
         if row is None or is_marker(row):
             return
         self.hide_tip()
         self.schedule_menu.entryconfigure(1, state="normal" if row.get("LopLengde") else "disabled")
+        rows = self.selected_rows()
+        self.class_menu.delete(0, "end")
+        for klasse in self.class_choices():
+            self.class_menu.add_command(label=klasse, command=lambda k=klasse: self.set_class(rows, k))
+        self.class_menu.add_separator()
+        self.class_menu.add_command(label="Annen klasse…", command=lambda: self.ask_class(rows))
+        self.class_menu.add_command(label="Fjern klasse", command=lambda: self.set_class(rows, ""))
+        self.schedule_menu.entryconfigure(
+            "end", label=f"Sett klasse ({len(rows)} utøvere)" if len(rows) > 1 else "Sett klasse")
         try:
             self.schedule_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.schedule_menu.grab_release()
+
+    def selected_rows(self):
+        # Utøverne som er merket i tidsplanen, uten grupper og pauser.
+        rows = []
+        for iid in self.schedule_tree.selection():
+            index = int(iid[1:])
+            if index < len(self.items) and not is_marker(self.items[index]):
+                rows.append(self.items[index])
+        return rows
+
+    def class_choices(self):
+        # Klassene fra skøyteforbundet, pluss andre klasser som er brukt i listen (f.eks. fra isonen).
+        used = {r.get("Klasse", "").strip() for r in self.rows} - {""}
+        known = {normalize_text(k) for k in SKATING_CLASSES}
+        extra = sorted((k for k in used if normalize_text(k) not in known), key=class_sort_key)
+        return SKATING_CLASSES + extra
+
+    def ask_class(self, rows):
+        klasse = simpledialog.askstring("Sett klasse", "Klasse:", parent=self.root)
+        if klasse is not None and klasse.strip():
+            self.set_class(rows, klasse.strip())
+
+    def set_class(self, rows, klasse):
+        if not rows:
+            return
+        for row in rows:
+            row["Klasse"] = klasse
+        names = ", ".join(run_name(r) for r in rows[:3]) + (f" og {len(rows) - 3} til" if len(rows) > 3 else "")
+        self.log(f"Klasse {klasse or '(ingen)'}: {names}")
+        self.refresh_schedule(select=rows[0])
+        self.schedule_tree.selection_set([f"i{self.index_of(r)}" for r in rows])
 
     def edit_run_length(self):
         row = self.selected_item()
@@ -2341,6 +2429,14 @@ class App:
         self.set_runner_order(sorted(
             self.active_rows(),
             key=lambda r: (normalize_text(r.get("FamilyName")), normalize_text(r.get("GivenName"))),
+        ))
+
+    def sort_by_class(self):
+        # Kortprogrammene i en klasse går før friløpene. Sorteringen er stabil, så rekkefølgen
+        # innen klasse og program beholdes (f.eks. etter Randomiser).
+        self.set_runner_order(sorted(
+            self.active_rows(),
+            key=lambda r: (class_sort_key(r.get("Klasse")), 0 if r.get("Segment") == "SP" else 1),
         ))
 
     def clear_rows(self):

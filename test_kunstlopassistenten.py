@@ -17,6 +17,7 @@ from kunstlopassistenten import (
     add_missing_segments,
     auto_group_size,
     build_startliste,
+    class_sort_key,
     compute_waveform,
     detect_audio_format,
     export_setup_package,
@@ -229,15 +230,15 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(wb.sheetnames, ["Startliste", "Med tidsforbruk"])
         plain, timed = wb["Startliste"], wb["Med tidsforbruk"]
         self.assertEqual([c.value for c in plain[3]],
-                         ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Navn", "Klubb"])
+                         ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Navn", "Klasse", "Klubb"])
         self.assertEqual([c.value for c in plain[4]][1:4], ["08:15:00", "-", "08:19:00"])
         self.assertEqual(plain["F4"].value, "Oppvarmingsgruppe 1")
         self.assertEqual(plain["B7"].value, "ca. 08:26:20")
         self.assertEqual([c.value for c in timed[3]],
                          ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Sammenlagt tidsforbruk",
-                          "Navn", "Klubb"])
+                          "Navn", "Klasse", "Klubb"])
         self.assertEqual([c.value for c in timed[5]], [1, "08:19:00", "-", "08:22:40", "00:03:10",
-                                                       "00:03:40", "Løper1 Test", "Loddefjord IL"])
+                                                       "00:03:40", "Løper1 Test", None, "Loddefjord IL"])
 
     def test_moved_water_pause_keeps_its_place_until_count_changes(self):
         items = layout_items(self.runners(4), 2, 2, 1)
@@ -426,6 +427,30 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual([(i.get("Segment"), i.get("Program")) for i in items[1:]],
                          [("SP", "Kortprogram"), ("FS", "Friløp")])
         self.assertEqual(add_missing_segments(items), 0)
+
+    def test_class_order_follows_skating_federation_list(self):
+        classes = ["", "Ukjent", "Junior Kvinner", "Cubs u/13", "Cubs", "Oppvisning", "Advanced Novice A",
+                   "Advanced Novice"]
+        self.assertEqual(sorted(classes, key=class_sort_key),
+                         ["Oppvisning", "Cubs u/13", "Cubs", "Advanced Novice", "Advanced Novice A",
+                          "Junior Kvinner", "Ukjent", ""])
+
+    def test_sort_by_class_keeps_order_within_class_and_puts_short_program_first(self):
+        app = App.__new__(App)
+        app.refresh_schedule = Mock()
+        rows = [self.runner("A", Klasse="Basic", Segment="FS"), self.runner("B", Klasse="Oppvisning"),
+                self.runner("C", Klasse="Basic", Segment="SP"), self.runner("D", Klasse="Oppvisning"),
+                self.runner("E")]
+        app.items = layout_items(rows, 1, 8, 0)
+
+        app.sort_by_class()
+
+        self.assertEqual([r["GivenName"] for r in app.rows], ["B", "D", "C", "A", "E"])
+
+    def test_startliste_has_class_for_runs_only(self):
+        items = layout_items([self.runner("A", Klasse="Springs")], 1, 8, 0)
+        entries = build_startliste(items, 190, datetime(2000, 1, 1, 8, 0))
+        self.assertEqual([e["klasse"] for e in entries], ["", "Springs"])
 
     def test_sorting_keeps_cancelled_runners_out_of_active_slots(self):
         app = App.__new__(App)
