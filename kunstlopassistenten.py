@@ -1,6 +1,7 @@
 import os
 import sys
 import zipfile
+import contextlib
 import csv
 import unicodedata
 from pathlib import Path, PurePosixPath
@@ -42,6 +43,10 @@ GOOD = "#86D9A3"
 BAD = "#F87171"
 
 SETUP_FILETYPES = [("Oppsett", "*.json"), ("Alle filer", "*.*")]
+# Oppsettpakke for flytting mellom PC-er: zip med oppsettet og lydfilene det bruker.
+PACKAGE_FILETYPES = [("Oppsettpakke", "*.zip"), ("Alle filer", "*.*")]
+PACKAGE_SETUP_NAME = "oppsett.json"
+PACKAGE_MUSIC_DIR = "musikk"
 
 # Programmene i musikktjenesten: mappenavn/filendelse i musikk-zip -> navn.
 SEGMENT_NAMES = {"SP": "Kortprogram", "FS": "Friløp"}
@@ -119,7 +124,8 @@ def split_segments(rows):
         if len(segments) > 1:
             row["Program"] = SEGMENT_NAMES["SP"]
             copy = dict(row, Segment="FS", Program=SEGMENT_NAMES["FS"], MusikkFil="", Musikk="",
-                        MusikkStatus="", MusikkTid="", MusikkSek="", LopGjennomfort=False)
+                        MusikkStatus="", MusikkTid="", MusikkSek="", MusikkManuell=False,
+                        LopGjennomfort=False)
             copy.pop("LopLengde", None)
             free_skates.append(copy)
     return out + free_skates
@@ -133,7 +139,8 @@ def add_missing_segments(items):
         if is_marker(item) or item.get("Program") or len(segments_for(item.get("Ovelse"))) < 2:
             continue
         items[k] = dict(item, Segment="SP", Program=SEGMENT_NAMES["SP"], MusikkFil="", Musikk="",
-                        MusikkStatus="", MusikkTid="", MusikkSek="", LopGjennomfort=False)
+                        MusikkStatus="", MusikkTid="", MusikkSek="", MusikkManuell=False,
+                        LopGjennomfort=False)
         items[k].pop("LopLengde", None)
         item["Segment"], item["Program"] = "FS", SEGMENT_NAMES["FS"]
         moved.append(item)
@@ -184,6 +191,40 @@ def find_music_for_row(row, music_index, used_files, fuzzy=True):
         return "", False
     used_files.add(free[0])
     return free[0], len(pool) > 1
+
+
+def ovelse_from_music(row, music_index):
+    # Prøvestevne fra Spond har ikke øvelse; den leses av lydfilene (_SP/_FS) til utøveren.
+    def segments(match):
+        return {info["segment"] for info in music_index.values() if info and match(info["name"])}
+
+    name = full_name_key(row)
+    found = segments(lambda n: n == name)
+    tokens = tokenize_name(row.get("GivenName"))[:1] + tokenize_name(row.get("FamilyName"))
+    if not found and len(tokens) > 1:
+        found = segments(lambda n: set(tokens) <= set(n.split()))
+    if found == {"SP", "FS"}:
+        return "Kortprogram+Friløp"
+    return SEGMENT_NAMES[found.pop()] if found else ""
+
+
+def music_file_name(filename):
+    # Filnavnet uten mappe, både for filer i zip (/) og filer på disken (\).
+    return re.split(r"[\\/]", filename or "")[-1]
+
+
+def analyze_audio(filename, data):
+    # Format og lengde på en lydfil. Returnerer (info, sekunder).
+    declared_suffix = Path(filename).suffix.lower()
+    audio_format, detected_suffix = detect_audio_format(data)
+    info = {
+        "format": audio_format,
+        "suffix": detected_suffix or declared_suffix,
+        "declared_suffix": declared_suffix,
+        "format_mismatch": bool(detected_suffix and declared_suffix != detected_suffix),
+        "playable": audio_format != "Ukjent",
+    }
+    return info, get_audio_duration(data, audio_format)
 
 
 def music_status_text(row, matched, status_map, uncertain=False):
@@ -342,22 +383,12 @@ def parse_date_ddmmyy(value):
         return None
 
 
+MONTHS = ["januar", "februar", "mars", "april", "mai", "juni", "juli", "august", "september", "oktober",
+          "november", "desember"]
+
+
 def format_date_long(date_obj):
-    months = [
-        "januar",
-        "februar",
-        "mars",
-        "april",
-        "mai",
-        "juni",
-        "juli",
-        "august",
-        "september",
-        "oktober",
-        "november",
-        "desember",
-    ]
-    return f"{date_obj.day} {months[date_obj.month - 1]} {date_obj.year}"
+    return f"{date_obj.day} {MONTHS[date_obj.month - 1]} {date_obj.year}"
 
 
 def is_registered(status):
@@ -452,6 +483,83 @@ def validate_setup(data):
         if length not in (None, "") and (isinstance(length, bool) or not isinstance(length, int) or length <= 0):
             return f"Rad {nr} ({display_name(item)}) har ugyldig lengde på løp: {length}"
     return None
+
+
+def export_setup_package(data, read_music, out_path):
+    # Skriver oppsettet og lydfilene radene bruker til én zip. read_music(fil) -> bytes, eller None
+    # når filen ikke finnes. Lydfilene legges i musikk/ og radene peker dit. Returnerer løp uten lydfil.
+    out_path = Path(out_path)
+    items = [dict(item) for item in data["items"]]
+    names, missing = {}, []
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(tmp_path, "w") as package:
+            for item in items:
+                source = item.get("MusikkFil")
+                if is_marker(item) or not source:
+                    continue
+                if source not in names:
+                    music = read_music(source)
+                    names[source] = None
+                    if music is not None:
+                        stem, suffix = os.path.splitext(music_file_name(source))
+                        name, n = f"{PACKAGE_MUSIC_DIR}/{stem}{suffix}", 1
+                        while name in names.values():
+                            n += 1
+                            name = f"{PACKAGE_MUSIC_DIR}/{stem}_{n}{suffix}"
+                        package.writestr(name, music)
+                        names[source] = name
+                if names[source] is None:
+                    missing.append(run_name(item))
+                item["MusikkFil"] = names[source] or ""
+            package_data = dict(data, items=items, source_dir="", music_zip="", music_folder="")
+            package.writestr(PACKAGE_SETUP_NAME, json.dumps(package_data, ensure_ascii=False, indent=2),
+                             compress_type=zipfile.ZIP_DEFLATED)
+        os.replace(tmp_path, out_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return missing
+
+
+def extract_setup_package(package_path, target_dir):
+    # Pakker ut en oppsettpakke i target_dir og returnerer oppsettet med full sti til lydfilene.
+    # Gir ValueError hvis filen ikke er en gyldig pakke.
+    target_dir = Path(target_dir)
+    with zipfile.ZipFile(package_path, "r") as package:
+        try:
+            data = json.loads(package.read(PACKAGE_SETUP_NAME).decode("utf-8"))
+        except KeyError:
+            raise ValueError("Filen er ikke en oppsettpakke fra Kunstløpassistenten.")
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise ValueError("Oppsettet i pakken er ugyldig.")
+        error = validate_setup(data)
+        if error:
+            raise ValueError(error)
+        music_dir = target_dir / PACKAGE_MUSIC_DIR
+        music_dir.mkdir(parents=True, exist_ok=True)
+        for item in data["items"]:
+            name = item.get("MusikkFil")
+            if is_marker(item) or not name:
+                continue
+            parts = name.split("/")
+            # Bare filer rett i musikk/, så pakken ikke kan skrive utenfor mappen.
+            if len(parts) != 2 or parts[0] != PACKAGE_MUSIC_DIR or parts[1] in ("", ".", "..") \
+                    or any(c in parts[1] for c in ':\\'):
+                item["MusikkFil"] = ""
+                continue
+            dest = music_dir / parts[1]
+            try:
+                dest.write_bytes(package.read(name))
+            except KeyError:
+                item["MusikkFil"] = ""
+                continue
+            item["MusikkFil"] = str(dest.resolve())
+    data["music_folder"] = str(music_dir.resolve())
+    return data
 
 
 def load_participants_from_excel(excel_path, log):
@@ -589,6 +697,72 @@ def participant_from_entry(entry):
     for field in ("NifId", "Klasse", "Ovelse"):
         row[field] = entry[field]
     return row
+
+
+def parse_spond_date(text, today=None):
+    # «lør. 31. oktober 08:15 - 11:45» -> (dato, "08:15"). Spond har ikke år; nærmeste dato velges.
+    today = today or datetime.now().date()
+    date_obj = None
+    match = re.search(r"(\d{1,2})\.\s*([a-zæøå]+)", text.lower())
+    if match and match.group(2) in MONTHS:
+        month = MONTHS.index(match.group(2)) + 1
+        for year in (today.year, today.year + 1, today.year - 1):
+            try:
+                candidate = datetime(year, month, int(match.group(1))).date()
+            except ValueError:
+                continue
+            if abs((candidate - today).days) <= 183:
+                date_obj = candidate
+                break
+    time_match = re.search(r"\b(\d{1,2}:\d{2})\b", text)
+    return date_obj, time_match.group(1) if time_match else ""
+
+
+def load_participants_from_spond(excel_path, log):
+    # Eksport fra Spond: arrangement, tid og sted øverst, så seksjoner «Deltar (N)», «Ikke svart (N)» osv.
+    # Utøverne står i kolonne A under «Deltar»; rader uten navn i kolonne A er foresatte.
+    # Returnerer (deltakere, {"title", "date", "start", "location"}).
+    try:
+        import openpyxl
+    except Exception:
+        log("Mangler openpyxl. Installer med: pip install openpyxl")
+        return [], {}
+
+    try:
+        ws = openpyxl.load_workbook(excel_path).worksheets[0]
+    except Exception as exc:
+        log(f"Kunne ikke lese excel: {excel_path} ({exc})")
+        return [], {}
+
+    names = [" ".join(cell_text(row[0]).split()) if row else "" for row in ws.iter_rows(values_only=True)]
+    section = re.compile(r"^\D+\(\d+\)$")
+    start = next((i for i, name in enumerate(names) if re.match(r"^Deltar \(\d+\)$", name)), None)
+    if start is None:
+        log("Finner ikke «Deltar (…)» i kolonne A. Er dette en deltakerliste fra Spond?")
+        return [], {}
+
+    rows = []
+    for name in names[start + 1:]:
+        if section.match(name):
+            break
+        if name and name != "Navn":
+            given, family = split_name(name)
+            rows.append(new_participant(given, family, status="Påmeldt"))
+
+    info = {}
+    heading = names[:start]
+    if heading and heading[0]:
+        info["title"] = heading[0]
+    if len(heading) > 1:
+        date_obj, start_time = parse_spond_date(heading[1])
+        if date_obj:
+            info["date"] = date_obj
+        if start_time:
+            info["start"] = start_time
+    if len(heading) > 2 and heading[2]:
+        info["location"] = heading[2]
+    log(f"Lest deltakere fra Spond: {excel_path} ({len(rows)} deltar)")
+    return rows, info
 
 
 def generate_excel(rows, out_path, log):
@@ -1026,8 +1200,9 @@ def generate_startliste_pdf(entries, out_path, title, log):
 
 
 def generate_vlc_playlist(rows, out_dir, base_name, music_zip, log):
-    if not music_zip:
-        log("Ingen musikk-zip funnet, kan ikke lage spilleliste.")
+    # Lydfiler med full sti (musikkmappe eller valgt manuelt) brukes direkte; resten pakkes ut av zip.
+    if not music_zip and not any(os.path.isabs(r.get("MusikkFil") or "") for r in rows):
+        log("Ingen musikk-zip eller lydfiler funnet, kan ikke lage spilleliste.")
         return False
 
     playlist_path = Path(out_dir) / f"Startliste_{base_name}.m3u"
@@ -1035,22 +1210,32 @@ def generate_vlc_playlist(rows, out_dir, base_name, music_zip, log):
     music_out.mkdir(parents=True, exist_ok=True)
 
     try:
-        with zipfile.ZipFile(music_zip, "r") as mz:
+        with zipfile.ZipFile(music_zip, "r") if music_zip else contextlib.nullcontext() as mz:
             lines = ["#EXTM3U"]
             for row in rows:
                 fname = row.get("MusikkFil", "")
                 if not fname:
                     continue
-                dest_path = music_out / fname
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                # Pakkes alltid ut på nytt, så en oppdatert zip med samme filnavn ikke gir gammel lyd.
-                try:
-                    mz.extract(fname, music_out)
-                except Exception as exc:
-                    if not dest_path.exists():
-                        log(f"Kunne ikke pakke ut {fname}: {exc}")
+                if os.path.isabs(fname):
+                    dest_path = Path(fname)
+                    if not dest_path.is_file():
+                        log(f"Fant ikke lydfil: {fname}")
                         continue
-                    log(f"ADVARSEL: Kunne ikke oppdatere {fname} ({exc}). Bruker filen som ligger der fra før.")
+                elif mz is None:
+                    log(f"Ingen musikk-zip for {fname}")
+                    continue
+                else:
+                    dest_path = music_out / fname
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Pakkes alltid ut på nytt, så en oppdatert zip med samme filnavn ikke gir gammel lyd.
+                    try:
+                        mz.extract(fname, music_out)
+                    except Exception as exc:
+                        if not dest_path.exists():
+                            log(f"Kunne ikke pakke ut {fname}: {exc}")
+                            continue
+                        log(f"ADVARSEL: Kunne ikke oppdatere {fname} ({exc}). "
+                            "Bruker filen som ligger der fra før.")
                 duration = row.get("MusikkSek", "")
                 performer = row.get("PrintName", "")
                 song = Path(fname).stem
@@ -1139,6 +1324,8 @@ class App:
         # Deltakerlisten fra musikktjenesten (entries_*.xlsx), slik at rekkefølgen på innlesingen ikke betyr noe.
         self.music_entries = []
         self.music_zip = None
+        # Mappe med lydfiler (prøvestevne). Lydfiler fra mappen og valgt manuelt lagres med full sti.
+        self.music_folder = None
         self.music_cache_dir = None
         self.music_file_info = {}
         self.music_files = []
@@ -1338,17 +1525,23 @@ class App:
             return menu
 
         menu_file = add_menu("Fil")
-        menu_file.add_command(label="Hent deltakerliste fra isonen…", command=self.load_isonen)
-        menu_file.add_command(label="Hent deltakere fra musikktjenesten…", command=self.load_music_entries)
-        menu_file.add_command(label="Velg musikk-zip…", command=self.choose_music_zip)
-        menu_file.add_command(
-            label="Skann mappe (isonen, musikktjenesten og musikk-zip)…", command=self.scan_folder
-        )
+        # Overskriftene er deaktiverte menyvalg.
+        menu_file.add_command(label="iSonen-stevne", state="disabled")
+        menu_file.add_command(label="    Hent deltakerliste fra isonen…", command=self.load_isonen)
+        menu_file.add_command(label="    Hent deltakerliste fra nsfcompetition (musikk)…",
+                              command=self.load_music_entries)
+        menu_file.add_command(label="    Hent musikk (zipfil fra nsfcompetition)…", command=self.choose_music_zip)
+        menu_file.add_separator()
+        menu_file.add_command(label="Prøvestevne", state="disabled")
+        menu_file.add_command(label="    Hent deltakerliste fra Spond…", command=self.load_spond)
+        menu_file.add_command(label="    Hent musikk fra mappe…", command=self.choose_music_folder)
         menu_file.add_separator()
         menu_file.add_command(label="Nytt oppsett", command=self.clear_rows)
         menu_file.add_command(label="Åpne oppsett…", accelerator="Ctrl+O", command=self.open_setup)
         menu_file.add_command(label="Lagre oppsett", accelerator="Ctrl+S", command=self.save_setup)
         menu_file.add_command(label="Lagre oppsett som…", command=lambda: self.save_setup(ask=True))
+        menu_file.add_command(label="Eksporter oppsett med musikk…", command=self.export_package)
+        menu_file.add_command(label="Importer oppsett med musikk…", command=self.import_package)
         menu_file.add_separator()
         menu_file.add_command(label="Avslutt", command=self.on_close)
         menu_reports = add_menu("Rapporter")
@@ -1513,6 +1706,11 @@ class App:
         self.schedule_menu.add_separator()
         self.schedule_menu.add_command(label="Rediger", command=self.edit_selected)
         self.schedule_menu.add_command(label="Slett", command=self.delete_selected)
+        self.schedule_menu.add_separator()
+        self.schedule_menu.add_command(label="Velg lydfil…",
+                                       command=lambda: self.choose_row_music(self.selected_item()))
+        self.schedule_menu.add_command(label="Fjern valgt lydfil",
+                                       command=lambda: self.clear_row_music(self.selected_item()))
         self.schedule_tree.bind("<Alt-Up>", lambda e: self.move_selected(-1) or "break")
         self.schedule_tree.bind("<Alt-Down>", lambda e: self.move_selected(1) or "break")
         self.schedule_tree.bind("<ButtonPress-1>", self.on_drag_start)
@@ -1568,8 +1766,13 @@ class App:
 
         bar = ttk.Frame(p, style="Panel.TFrame")
         bar.grid(row=1, column=0, sticky="we", pady=(0, 12))
-        ttk.Button(bar, text="Velg musikk-zip…", style="Accent.TButton",
+        ttk.Button(bar, text="Hent musikk (zipfil fra nsfcompetition)…", style="Accent.TButton",
                    command=self.choose_music_zip).pack(side="left")
+        ttk.Button(bar, text="Hent musikk fra mappe…", command=self.choose_music_folder).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(bar, text="Velg lydfil for utøver…",
+                   command=lambda: self.choose_row_music(self.selected_table_row())).pack(
+            side="left", padx=(8, 0))
         ttk.Button(bar, text="Lag spilleliste", command=self.generate_playlist_only).pack(
             side="left", padx=(8, 0))
         ttk.Checkbutton(bar, text="Bruk VLC direkte", variable=self.use_external_player_var,
@@ -1609,6 +1812,12 @@ class App:
         self.tree.tag_configure("completed", foreground=GOOD, background="#16302A")
         self.tree.bind("<Button-1>", self.on_tree_checkbox_click)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
+        self.tree.bind("<Button-3>", self.on_tree_right_click)
+        self.tree_menu = tk.Menu(self.tree, **self.menu_options)
+        self.tree_menu.add_command(label="Velg lydfil…",
+                                   command=lambda: self.choose_row_music(self.selected_table_row()))
+        self.tree_menu.add_command(label="Fjern valgt lydfil",
+                                   command=lambda: self.clear_row_music(self.selected_table_row()))
         self.tree.bind("<Return>", lambda e: self.toggle_play_pause())
         self.tree.bind("<<TreeviewSelect>>", lambda e: self.schedule_waveform_preview())
         self.tree.bind("<space>", lambda e: self.player_key(self.toggle_play_pause))
@@ -1620,7 +1829,8 @@ class App:
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll.grid(row=0, column=1, sticky="ns")
         ttk.Label(p, text="Dobbeltklikk eller Enter spiller lydfilen. Mellomrom: spill/pause, Esc: stopp, "
-                          f"←/→: spol {SKIP_SECONDS} s. Klikk i «Løp gjennomført» for å krysse av.",
+                          f"←/→: spol {SKIP_SECONDS} s. Klikk i «Løp gjennomført» for å krysse av. "
+                          "Høyreklikk for å velge lydfil.",
                   style="PanelDim.TLabel").grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         self.table_columns = tuple(columns)
@@ -1746,6 +1956,8 @@ class App:
         parts.append(f"{len(self.active_rows())} utøvere")
         if self.music_zip:
             parts.append(f"Musikk: {self.music_zip.name}")
+        elif self.music_folder:
+            parts.append(f"Musikk: {self.music_folder.name}")
         self.status_var.set(" · ".join(parts))
 
     # -------------------- Tidsplan --------------------
@@ -1952,7 +2164,7 @@ class App:
         if club is None:
             return
         given, family = split_name(name.strip())
-        if (given, family) != (row.get("GivenName"), row.get("FamilyName")):
+        if (given, family) != (row.get("GivenName"), row.get("FamilyName")) and not row.get("MusikkManuell"):
             row["MusikkFil"] = ""
         row["GivenName"], row["FamilyName"] = given, family
         row["NavnFraIsonen"] = f"{given} {family}".strip()
@@ -2147,28 +2359,17 @@ class App:
     def save_setup(self, ask=False):
         path = self.setup_path
         if ask or not path:
-            date_obj = parse_date_ddmmyy(self.start_date_var.get())
-            date_part = date_obj.strftime("%Y-%m-%d") if date_obj else "dato"
-            location = self.location_var.get().strip() or "sted"
             path = filedialog.asksaveasfilename(
                 title="Lagre oppsett",
                 defaultextension=".json",
                 filetypes=SETUP_FILETYPES,
-                initialfile=sanitize_filename(f"Oppsett_{location}_{date_part}") + ".json",
+                initialfile=self.setup_file_stem() + ".json",
                 initialdir=str(path.parent if path else self.output_dir()),
             )
             if not path:
                 return False
             path = Path(path)
-        data = {
-            "type": "kunstlopassistenten-oppsett",
-            "version": 1,
-            "saved": datetime.now().isoformat(timespec="seconds"),
-            "settings": {key: var.get() for key, var in self.setup_vars.items()},
-            "source_dir": str(self.source_dir) if self.source_dir else "",
-            "music_zip": str(self.music_zip) if self.music_zip else "",
-            "items": self.items,
-        }
+        data = self.setup_data()
         # Skriver til en midlertidig fil først, så forrige oppsett ikke ødelegges hvis skrivingen feiler.
         tmp_path = path.with_name(path.name + ".tmp")
         try:
@@ -2187,6 +2388,92 @@ class App:
         self.update_status()
         self.log(f"Lagret oppsett: {path}")
         return True
+
+    def setup_data(self):
+        return {
+            "type": "kunstlopassistenten-oppsett",
+            "version": 1,
+            "saved": datetime.now().isoformat(timespec="seconds"),
+            "settings": {key: var.get() for key, var in self.setup_vars.items()},
+            "source_dir": str(self.source_dir) if self.source_dir else "",
+            "music_zip": str(self.music_zip) if self.music_zip else "",
+            "music_folder": str(self.music_folder) if self.music_folder else "",
+            "items": self.items,
+        }
+
+    def setup_file_stem(self):
+        date_obj = parse_date_ddmmyy(self.start_date_var.get())
+        date_part = date_obj.strftime("%Y-%m-%d") if date_obj else "dato"
+        location = self.location_var.get().strip() or "sted"
+        return sanitize_filename(f"Oppsett_{location}_{date_part}")
+
+    def read_music_bytes(self, filename):
+        # Lydfil fra disken (musikkmappe/valgt manuelt) eller fra musikk-zip; None hvis den mangler.
+        try:
+            if os.path.isabs(filename):
+                return Path(filename).read_bytes()
+            if self.music_zip:
+                with zipfile.ZipFile(self.music_zip, "r") as mz:
+                    return mz.read(filename)
+        except (OSError, KeyError, zipfile.BadZipFile):
+            pass
+        return None
+
+    def export_package(self):
+        # Oppsettpakke for å flytte stevnet til en annen PC: tidsplan, innstillinger og lydfilene.
+        if not self.items:
+            messagebox.showinfo("Eksporter oppsett", "Det er ikke noe oppsett å eksportere.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Eksporter oppsett med musikk",
+            defaultextension=".zip",
+            filetypes=PACKAGE_FILETYPES,
+            initialfile=f"{self.setup_file_stem()}_med_musikk.zip",
+            initialdir=str(self.setup_path.parent if self.setup_path else self.output_dir()),
+        )
+        if not path:
+            return
+        self.log("Eksporterer oppsett med musikk…")
+        try:
+            missing = export_setup_package(self.setup_data(), self.read_music_bytes, path)
+        except Exception as exc:
+            messagebox.showerror("Feil", f"Kunne ikke eksportere oppsettet:\n{exc}")
+            return
+        for name in missing:
+            self.log(f"ADVARSEL: Fant ikke lydfilen til {name}; den er ikke med i pakken.")
+        self.log(f"Eksportert oppsett med musikk: {path}")
+        text = f"Oppsettet og musikken er lagret i:\n{path}"
+        if missing:
+            text += f"\n\n{len(missing)} løp mangler lydfil i pakken (se loggen)."
+        messagebox.showinfo("Eksport ferdig", text)
+
+    def import_package(self):
+        if not self.confirm_discard():
+            return
+        path = filedialog.askopenfilename(
+            title="Importer oppsett med musikk",
+            filetypes=PACKAGE_FILETYPES,
+            initialdir=str(Path.home() / "Downloads"),
+        )
+        if not path:
+            return
+        # Pakkes ut i Dokumenter/Kunstløpassistenten/<pakkenavn>, med nytt navn hvis mappen finnes.
+        base = Path.home() / "Documents" / APP_NAME / sanitize_filename(Path(path).stem)
+        target, n = base, 1
+        while target.exists():
+            n += 1
+            target = base.with_name(f"{base.name}_{n}")
+        try:
+            data = extract_setup_package(path, target)
+        except (ValueError, OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+            shutil.rmtree(target, ignore_errors=True)
+            messagebox.showerror("Feil", f"Kunne ikke importere oppsettet:\n{exc}")
+            return
+        self.apply_setup(data, target / PACKAGE_SETUP_NAME)
+        # Lagres med en gang, så Ctrl+S og «Åpne oppsett» virker på den nye PC-en.
+        self.save_setup()
+        self.log(f"Importert oppsett med musikk til: {target}")
+        self.show_folder_link(target, "Import ferdig", "Oppsettet og musikken er lagt i:")
 
     def open_setup(self):
         if not self.confirm_discard():
@@ -2213,7 +2500,9 @@ class App:
         if error:
             messagebox.showerror("Feil", f"Kunne ikke åpne oppsettet:\n{error}")
             return
+        self.apply_setup(data, path)
 
+    def apply_setup(self, data, path):
         self._loading = True
         try:
             for key, value in (data.get("settings") or {}).items():
@@ -2229,11 +2518,17 @@ class App:
         # Musikk fra forrige oppsett skal aldri henge igjen.
         self.reset_music()
         music = data.get("music_zip")
+        folder = data.get("music_folder")
         if music and Path(music).is_file():
             self.load_music_zip(music, match=False)
             self.match_missing_music()
         elif music:
             self.log(f"Fant ikke musikk-zip fra oppsettet: {music}")
+        elif folder and Path(folder).is_dir():
+            self.load_music_folder(folder, match=False)
+            self.match_missing_music()
+        elif folder:
+            self.log(f"Fant ikke musikkmappen fra oppsettet: {folder}")
         self.setup_path = Path(path)
         self.refresh_schedule()
         self.dirty = False
@@ -2283,6 +2578,26 @@ class App:
         elif self.confirm_replace():
             self.use_participants([participant_from_entry(e) for e in entries], Path(path).parent)
 
+    def load_spond(self):
+        # Prøvestevne: deltakerne fra Spond, uten klasse og musikk. Program (SP/FS) hentes fra lydfilene.
+        initial = self.source_dir or (Path.home() / "Downloads")
+        path = filedialog.askopenfilename(
+            title="Velg deltakerliste fra Spond",
+            initialdir=str(initial),
+            filetypes=[("Excel", "*.xlsx"), ("Alle filer", "*.*")],
+        )
+        if not path or not self.confirm_replace():
+            return
+        rows, info = load_participants_from_spond(path, self.log)
+        if not rows:
+            messagebox.showerror("Feil", "Fant ingen deltakere under «Deltar» i Spond-filen.")
+            return
+        self.music_entries = []
+        self.apply_event_info(info, "Spond")
+        self.use_participants(rows, Path(path).parent)
+        if not self.music_files:
+            self.log("Velg musikkmappen (Fil → Hent musikk fra mappe…) for å koble lydfilene til utøverne.")
+
     def use_participants(self, rows, source_dir):
         # Ny deltakerliste: kobles mot musikktjenesten, deles i kortprogram/friløp og kobles mot musikk-zip.
         # Musikktjenesten flettes inn først, siden den kan ha øvelsen som mangler i isonen.
@@ -2303,14 +2618,18 @@ class App:
         self.relayout(auto_size=True)
         self.refresh_schedule()
 
-    def apply_event_info(self, info):
+    def apply_event_info(self, info, source="musikktjenesten"):
         if info.get("title"):
             self.event_name_var.set(info["title"])
         if info.get("date"):
             self.start_date_var.set(info["date"].strftime("%d.%m.%y"))
+        if info.get("start"):
+            self.start_time_var.set(info["start"])
+        if info.get("location"):
+            self.location_var.set(info["location"])
         if info:
             date = f" {info['date']:%d.%m.%Y}" if info.get("date") else ""
-            self.log(f"Stevne fra musikktjenesten: {info.get('title', '')}{date}")
+            self.log(f"Stevne fra {source}: {info.get('title', '')}{date}")
 
     def apply_music_entries(self):
         # Kobler deltakerne fra musikktjenesten til radene med NIF ID (= Person ID i isonen), ellers navn.
@@ -2344,6 +2663,14 @@ class App:
             filetypes=[("Zip", "*.zip"), ("Alle filer", "*.*")],
         )
         if path and self.load_music_zip(path):
+            self.refresh_schedule()
+
+    def choose_music_folder(self):
+        path = filedialog.askdirectory(
+            title="Velg mappe med lydfiler (Fornavn_Etternavn_SP.mp3 / _FS.mp3)",
+            initialdir=str(self.music_folder or self.source_dir or (Path.home() / "Downloads")),
+        )
+        if path and self.load_music_folder(path):
             self.refresh_schedule()
 
     def scan_folder(self):
@@ -2395,6 +2722,7 @@ class App:
 
     def reset_music(self):
         self.music_zip = None
+        self.music_folder = None
         self.music_cache_dir = None
         self.music_file_info = {}
         self.music_files = []
@@ -2418,43 +2746,19 @@ class App:
                         text = mz.read(entry).decode("utf-8-sig", errors="replace")
                         status = parse_music_status_csv(text)
                         continue
-                    declared_suffix = Path(entry.filename).suffix.lower()
-                    if declared_suffix not in AUDIO_SUFFIXES:
+                    if Path(entry.filename).suffix.lower() not in AUDIO_SUFFIXES:
                         continue
-                    data = mz.read(entry)
-                    audio_format, detected_suffix = detect_audio_format(data)
-                    format_mismatch = bool(detected_suffix and declared_suffix != detected_suffix)
                     files.append(entry.filename)
                     index[entry.filename] = parse_music_path(entry.filename)
-                    durations[entry.filename] = get_audio_duration(data, audio_format)
-                    file_info[entry.filename] = {
-                        "format": audio_format,
-                        "suffix": detected_suffix or declared_suffix,
-                        "declared_suffix": declared_suffix,
-                        "format_mismatch": format_mismatch,
-                        "playable": audio_format != "Ukjent",
-                    }
-                    if audio_format == "Ukjent":
-                        self.log(f"ADVARSEL: Ukjent lydformat: {entry.filename}")
-                    elif format_mismatch:
-                        self.log(
-                            f"ADVARSEL: {entry.filename} har filendelsen "
-                            f"{declared_suffix}, men er egentlig {audio_format}."
-                        )
+                    file_info[entry.filename], durations[entry.filename] = self.check_audio(
+                        entry.filename, mz.read(entry))
         except Exception as exc:
             self.log(f"Kunne ikke lese musikk-zip: {music_zip} ({exc})")
             messagebox.showerror("Feil", f"Kunne ikke lese musikk-zip:\n{exc}")
             return False
         self.reset_music()
         self.music_zip = music_zip
-        self.music_files, self.music_index, self.music_durations = files, index, durations
-        self.music_file_info, self.music_status = file_info, status
-        warnings = sum(1 for info in self.music_file_info.values() if info.get("format_mismatch"))
-        errors = sum(1 for info in self.music_file_info.values() if not info.get("playable"))
-        self.log(
-            f"Lydkontroll: {len(self.music_files)} filer, {warnings} med feil filendelse, "
-            f"{errors} med ukjent format."
-        )
+        self.use_music(files, index, durations, file_info, status)
         if self.music_status:
             self.log(f"Leste music-status.csv: {len(self.music_status)} program.")
         elif any(self.music_index.values()):
@@ -2463,6 +2767,51 @@ class App:
         if match:
             self.match_all_music()
         return True
+
+    def load_music_folder(self, folder, match=True):
+        # Mappe med lydfiler, også i undermapper. Navnet i filnavnet kobles mot deltakerlisten;
+        # _SP/_FS bak navnet gir programmet, filer uten regnes som friløp.
+        folder = Path(folder)
+        files, index, durations, file_info = [], {}, {}, {}
+        self.log(f"Leser musikkmappe: {folder}")
+        try:
+            paths = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_SUFFIXES)
+            for path in paths:
+                key = str(path.resolve())
+                files.append(key)
+                index[key] = parse_music_path(path.relative_to(folder).as_posix()) or {
+                    "name": normalize_text(path.stem.replace("_", " ")), "segment": "FS", "category": ""}
+                file_info[key], durations[key] = self.check_audio(path.name, path.read_bytes())
+        except Exception as exc:
+            self.log(f"Kunne ikke lese musikkmappe: {folder} ({exc})")
+            messagebox.showerror("Feil", f"Kunne ikke lese musikkmappen:\n{exc}")
+            return False
+        self.reset_music()
+        self.music_folder = folder
+        self.use_music(files, index, durations, file_info, {})
+        self.music_info_var.set(f"{folder.name} · {len(self.music_files)} lydfiler")
+        if match:
+            self.match_all_music()
+        return True
+
+    def check_audio(self, filename, data):
+        info, seconds = analyze_audio(filename, data)
+        if not info["playable"]:
+            self.log(f"ADVARSEL: Ukjent lydformat: {filename}")
+        elif info["format_mismatch"]:
+            self.log(f"ADVARSEL: {filename} har filendelsen {info['declared_suffix']}, "
+                     f"men er egentlig {info['format']}.")
+        return info, seconds
+
+    def use_music(self, files, index, durations, file_info, status):
+        self.music_files, self.music_index, self.music_durations = files, index, durations
+        self.music_file_info, self.music_status = file_info, status
+        warnings = sum(1 for info in self.music_file_info.values() if info.get("format_mismatch"))
+        errors = sum(1 for info in self.music_file_info.values() if not info.get("playable"))
+        self.log(
+            f"Lydkontroll: {len(self.music_files)} filer, {warnings} med feil filendelse, "
+            f"{errors} med ukjent format."
+        )
 
     def find_music_file(self, row, used_files, fuzzy=True):
         # Returnerer (fil, usikker).
@@ -2477,11 +2826,14 @@ class App:
         matched, uncertain = self.find_music_file(row, used_files, fuzzy)
         info = self.music_file_info.get(matched, {}) if matched else {}
         seconds = self.music_durations.get(matched) if matched else None
+        status = music_status_text(row, matched, self.music_status, uncertain) if self.music_files else ""
+        self.set_row_music(row, matched, info, seconds, status, uncertain)
+
+    def set_row_music(self, row, matched, info, seconds, status, uncertain=False):
         row["Musikk"] = "ok" if matched else "mangler"
         row["MusikkFil"] = matched
         row["MusikkUsikker"] = uncertain
-        row["MusikkStatus"] = (music_status_text(row, matched, self.music_status, uncertain)
-                               if self.music_files else "")
+        row["MusikkStatus"] = status
         row["MusikkFormat"] = info.get("format", "")
         row["MusikkFormatAvvik"] = info.get("format_mismatch", False)
         row["MusikkSpillbar"] = info.get("playable", bool(matched))
@@ -2494,14 +2846,30 @@ class App:
 
     def match_rows(self, rows, used):
         # Eksakte navn kobles for alle først, så løsere treff ikke tar filen fra en med eksakt navn.
+        # Lydfiler valgt manuelt beholdes.
+        rows = [r for r in rows if not r.get("MusikkManuell")]
         for row in rows:
             self.apply_music_match(row, used, fuzzy=False)
         for row in rows:
             if not row.get("MusikkFil"):
                 self.apply_music_match(row, used)
 
+    def apply_music_segments(self):
+        # Utøvere uten øvelse (Spond) får program fra lydfilene; med både _SP og _FS blir det to løp.
+        for row in self.rows:
+            if row.get("Ovelse") or row.get("Program") or row.get("MusikkManuell"):
+                continue
+            ovelse = ovelse_from_music(row, self.music_index)
+            if ovelse:
+                row["Ovelse"] = ovelse
+                row["Segment"] = segments_for(ovelse)[0]
+        added = add_missing_segments(self.items)
+        if added:
+            self.log(f"{added} utøvere har både kortprogram og friløp. Friløpene er lagt bakerst i tidsplanen.")
+
     def match_all_music(self):
-        used = set()
+        self.apply_music_segments()
+        used = {r["MusikkFil"] for r in self.rows if r.get("MusikkManuell") and r.get("MusikkFil")}
         self.match_rows(self.rows, used)
         active = self.active_rows()
         missing = [r for r in active if not r.get("MusikkFil")]
@@ -2521,6 +2889,70 @@ class App:
             return
         used = {r.get("MusikkFil") for r in self.rows if r.get("MusikkFil")}
         self.match_rows([r for r in self.rows if not r.get("MusikkFil")], used)
+
+    def choose_row_music(self, row):
+        # Velger lydfil for én utøver (ett program). Valget overstyrer automatisk kobling.
+        if row is None or is_marker(row):
+            messagebox.showinfo("Velg lydfil", "Velg en utøver i listen først.", parent=self.root)
+            return
+        current = row.get("MusikkFil") or ""
+        initial = (Path(current).parent if os.path.isabs(current)
+                   else self.music_folder or self.source_dir or (Path.home() / "Downloads"))
+        path = filedialog.askopenfilename(
+            title=f"Velg lydfil for {run_name(row)}",
+            initialdir=str(initial),
+            filetypes=[("Lydfiler", " ".join(f"*{s}" for s in sorted(AUDIO_SUFFIXES))), ("Alle filer", "*.*")],
+        )
+        if not path:
+            return
+        path = Path(path).resolve()
+        try:
+            info, seconds = self.check_audio(path.name, path.read_bytes())
+        except OSError as exc:
+            messagebox.showerror("Feil", f"Kunne ikke lese lydfilen:\n{exc}", parent=self.root)
+            return
+        if self.current_track == current:
+            self.reset_player()
+        parsed = parse_music_path(path.name)
+        if parsed and not row.get("Program"):
+            # Bare ett program: filnavnet (_SP/_FS) bestemmer programmet.
+            row["Segment"], row["Ovelse"] = parsed["segment"], SEGMENT_NAMES[parsed["segment"]]
+        self.set_row_music(row, str(path), info, seconds, "Valgt manuelt")
+        row["MusikkManuell"] = True
+        self.log(f"Lydfil for {run_name(row)}: {path}")
+        self.refresh_schedule(select=row)
+
+    def clear_row_music(self, row):
+        if row is None or is_marker(row) or not row.get("MusikkFil"):
+            return
+        if self.current_track == row.get("MusikkFil"):
+            self.reset_player()
+        row["MusikkManuell"] = False
+        self.set_row_music(row, "", {}, None, "")
+        self.match_missing_music()
+        self.log(f"Fjernet valgt lydfil for {run_name(row)}.")
+        self.refresh_schedule(select=row)
+
+    def selected_table_row(self):
+        selected = self.tree.selection()
+        if not selected:
+            return None
+        index = self.tree.index(selected[0])
+        rows = self.rows
+        return rows[index] if index < len(rows) else None
+
+    def on_tree_right_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        row = self.selected_table_row()
+        self.tree_menu.entryconfigure(1, state="normal" if row and row.get("MusikkFil") else "disabled")
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
 
     def match_music_file(self, row, music_files, used_files, fuzzy=True):
         given = row.get("GivenName")
@@ -2561,7 +2993,7 @@ class App:
         selected = self.tree.selection()
         selected_index = self.tree.index(selected[0]) if selected else None
         self.tree.delete(*self.tree.get_children())
-        has_music = bool(self.music_files)
+        has_music = bool(self.music_files) or any(r.get("MusikkManuell") for r in self.rows)
         rows_values = []
         nr = 1
         for row in self.rows:
@@ -2589,7 +3021,7 @@ class App:
                 SEGMENT_NAMES.get(row.get("Segment") or "FS", ""),
                 row.get("Påmelding", ""),
                 (row.get("MusikkStatus") or "Mangler musikk") if missing else row.get("MusikkStatus", ""),
-                PurePosixPath(row.get("MusikkFil") or "").name,
+                music_file_name(row.get("MusikkFil")),
                 row.get("MusikkFormat", ""),
                 row.get("MusikkTid", ""),
             )
@@ -2715,6 +3147,12 @@ class App:
         showerror = (lambda *a: None) if quiet else messagebox.showerror
         if not filename:
             showinfo("Info", "Ingen lydfil registrert på denne raden.")
+            return None
+        if os.path.isabs(filename):
+            # Fra musikkmappe eller valgt manuelt: spilles direkte fra disken.
+            if Path(filename).is_file():
+                return Path(filename)
+            showerror("Feil", f"Fant ikke lydfilen:\n{filename}")
             return None
         if not self.music_zip:
             showerror("Feil", "Fant ingen musikk-zip.")
@@ -3406,15 +3844,17 @@ class App:
         self.report_export(results, out_dir, "Startliste ferdig", "Startlisten er lagret i:")
 
     def generate_playlist_only(self):
-        if not self.music_zip:
-            messagebox.showerror("Feil", "Velg en musikk-zip først.")
-            return
         active = self.active_rows()
+        if not self.music_zip and not any(r.get("MusikkFil") for r in active):
+            messagebox.showerror("Feil", "Velg en musikk-zip, en musikkmappe eller lydfiler først.")
+            return
         if not active:
             messagebox.showwarning("Info", "Ingen utøvere i listen.")
             return
         out_dir = self.output_dir()
-        ok = generate_vlc_playlist(active, out_dir, self.music_zip.stem, self.music_zip, self.log)
+        source = self.music_zip or self.music_folder
+        base_name = source.stem if source else sanitize_filename(self.event_name_var.get())
+        ok = generate_vlc_playlist(active, out_dir, base_name, self.music_zip, self.log)
         self.report_export({"spilleliste": ok}, out_dir, "Spilleliste ferdig", "Spillelisten er lagret i:")
 
     def show_folder_link(self, folder_path, title, text):

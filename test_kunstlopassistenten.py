@@ -1,4 +1,5 @@
 import io
+import json
 import queue
 import tempfile
 import unittest
@@ -18,15 +19,20 @@ from kunstlopassistenten import (
     build_startliste,
     compute_waveform,
     detect_audio_format,
+    export_setup_package,
+    extract_setup_package,
     find_music_for_row,
     generate_startliste_excel,
     generate_vlc_playlist,
     get_audio_duration,
     group_overflows,
     layout_items,
+    load_participants_from_spond,
     new_participant,
+    ovelse_from_music,
     parse_duration_mmss,
     parse_music_path,
+    parse_spond_date,
     place_water_pauses,
     split_segments,
     validate_setup,
@@ -445,6 +451,86 @@ class RegressionTests(unittest.TestCase):
             dict(valid, items=[self.runner("A", Påmelding=5)]),
         ):
             self.assertIsNotNone(validate_setup(broken), broken)
+
+    def test_reads_only_attending_from_spond(self):
+        import openpyxl
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "spond.xlsx"
+            wb = openpyxl.Workbook()
+            for row in (["Prøvestevne"], ["lør. 31. oktober 08:15 - 11:45"], ["Iskanten"], [None],
+                        ["Deltar (2)"], ["Navn", "Foresatt"], ["Anna  Marie Berg"], [None, "Forelder"],
+                        ["Ola Hansen"], ["Ikke svart (1)"], ["Navn"], ["Kari Nordmann"]):
+                wb.active.append(row)
+            wb.save(path)
+
+            rows, info = load_participants_from_spond(path, Mock())
+
+        self.assertEqual([(r["GivenName"], r["FamilyName"]) for r in rows],
+                         [("Anna Marie", "Berg"), ("Ola", "Hansen")])
+        self.assertEqual((info["title"], info["start"], info["location"]), ("Prøvestevne", "08:15", "Iskanten"))
+        self.assertEqual(info["date"].strftime("%d.%m"), "31.10")
+
+    def test_spond_date_picks_nearest_year(self):
+        today = datetime(2026, 12, 20).date()
+        self.assertEqual(parse_spond_date("lør. 9. januar 10:00", today),
+                         (datetime(2027, 1, 9).date(), "10:00"))
+
+    def test_program_comes_from_music_files(self):
+        index = {f: parse_music_path(f) for f in ("Bjørg_Mariann_Bjarndisson_FS.mp3",
+                                                   "Alva_Teodora_Bjarndisson_SP.mp3",
+                                                   "Alva_Teodora_Bjarndisson_FS.mp3")}
+        self.assertEqual(ovelse_from_music(self.runner("Bjørg Mariann", "Bjarndisson"), index), "Friløp")
+        self.assertEqual(ovelse_from_music(self.runner("Alva Teodora", "Bjarndisson"), index),
+                         "Kortprogram+Friløp")
+        self.assertEqual(ovelse_from_music(self.runner("Ida", "Chen"), index), "")
+
+    def test_manual_music_is_kept_when_matching(self):
+        app = App.__new__(App)
+        app.music_files = ["/m/Anna_Test_FS.mp3"]
+        app.music_index = {f: parse_music_path(Path(f).name) for f in app.music_files}
+        app.music_file_info, app.music_durations, app.music_status = {}, {}, {}
+        row = self.runner("Anna", Segment="FS", MusikkFil="/egen/sang.mp3", MusikkManuell=True)
+
+        app.match_rows([row], set())
+
+        self.assertEqual(row["MusikkFil"], "/egen/sang.mp3")
+
+    def test_setup_package_round_trip_with_music(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            song = temp / "Anna_Test_FS.mp3"
+            song.write_bytes(b"ID3-disk")
+            items = [{"Kind": "warmup"},
+                     self.runner("Anna", MusikkFil=str(song), LopLengde=150),
+                     self.runner("Ola", MusikkFil="Stevne/FS/Anna_Test_FS.mp3"),
+                     self.runner("Kari", MusikkFil=str(temp / "borte.mp3"))]
+            data = {"type": "kunstlopassistenten-oppsett", "version": 1, "settings": {"start": "08:15"},
+                    "items": items}
+            music = {str(song): b"ID3-disk", "Stevne/FS/Anna_Test_FS.mp3": b"ID3-zip"}
+
+            missing = export_setup_package(data, music.get, temp / "pakke.zip")
+            imported = extract_setup_package(temp / "pakke.zip", temp / "ny")
+
+            self.assertEqual(missing, ["Kari Test"])
+            rows = imported["items"][1:]
+            self.assertEqual([Path(r["MusikkFil"]).read_bytes() for r in rows[:2]], [b"ID3-disk", b"ID3-zip"])
+            self.assertEqual(rows[2]["MusikkFil"], "")
+            self.assertEqual((imported["settings"], rows[0]["LopLengde"]), ({"start": "08:15"}, 150))
+            self.assertEqual(items[1]["MusikkFil"], str(song))
+
+    def test_setup_package_cannot_write_outside_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            data = {"type": "kunstlopassistenten-oppsett", "items": [self.runner("A", MusikkFil="musikk/../x.mp3")]}
+            with zipfile.ZipFile(temp / "pakke.zip", "w") as package:
+                package.writestr("oppsett.json", json.dumps(data))
+                package.writestr("x.mp3", b"ID3")
+
+            imported = extract_setup_package(temp / "pakke.zip", temp / "ny")
+
+            self.assertEqual(imported["items"][0]["MusikkFil"], "")
+            self.assertFalse((temp / "ny" / "x.mp3").exists())
 
     def test_playlist_uses_updated_music_from_zip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
