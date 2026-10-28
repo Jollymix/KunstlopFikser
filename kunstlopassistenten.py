@@ -1167,14 +1167,19 @@ def generate_startliste_pdf(entries, out_path, title, log):
         log("Mangler reportlab. Installer med: pip install reportlab")
         return False
 
-    font_name = "Helvetica"
+    font_name, bold_name = "Helvetica", "Helvetica-Bold"
     try:
         calibri_path = Path("C:/Windows/Fonts/calibri.ttf")
         if calibri_path.exists():
             pdfmetrics.registerFont(TTFont("Calibri", str(calibri_path)))
             font_name = "Calibri"
+            # Fet Calibri i gruppe-radene er smalere enn fet Helvetica og passer resten av listen.
+            bold_path = Path("C:/Windows/Fonts/calibrib.ttf")
+            if bold_path.exists():
+                pdfmetrics.registerFont(TTFont("Calibri-Bold", str(bold_path)))
+                bold_name = "Calibri-Bold"
     except Exception:
-        font_name = "Helvetica"
+        font_name, bold_name = "Helvetica", "Helvetica-Bold"
 
     # (nøkkel, overskrift, overskriften kan brytes, tekstkolonne som kan brytes ved behov).
     columns = [
@@ -1202,8 +1207,8 @@ def generate_startliste_pdf(entries, out_path, title, log):
                 width = max(width, pdfmetrics.stringWidth(text, font_name, size))
                 if not is_text:
                     # Tider i gruppe-radene skrives med fet skrift.
-                    width = max(width, pdfmetrics.stringWidth(text, "Helvetica-Bold", size))
-            widths.append(width + 2 * pad + 2)
+                    width = max(width, pdfmetrics.stringWidth(text, bold_name, size))
+            widths.append(width + 2 * pad + 1)
         return widths
 
     # Stående A4 med 10 pt, så stående med 9 pt, og liggende A4 hvis det fortsatt er for trangt.
@@ -1263,7 +1268,7 @@ def generate_startliste_pdf(entries, out_path, title, log):
             style_cmds.append(
                 ("BACKGROUND", (0, row_idx), (-1, row_idx), colors.HexColor("#D0D0D0"))
             )
-            style_cmds.append(("FONTNAME", (0, row_idx), (-1, row_idx), "Helvetica-Bold"))
+            style_cmds.append(("FONTNAME", (0, row_idx), (-1, row_idx), bold_name))
         row_idx += 1
     table.setStyle(TableStyle(style_cmds))
     story.append(table)
