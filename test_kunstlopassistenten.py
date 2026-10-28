@@ -230,15 +230,16 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(wb.sheetnames, ["Startliste", "Med tidsforbruk"])
         plain, timed = wb["Startliste"], wb["Med tidsforbruk"]
         self.assertEqual([c.value for c in plain[3]],
-                         ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Navn", "Klasse", "Klubb"])
+                         ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Navn", "Klasse", "Program", "Klubb"])
         self.assertEqual([c.value for c in plain[4]][1:4], ["08:15:00", "-", "08:19:00"])
         self.assertEqual(plain["F4"].value, "Oppvarmingsgruppe 1")
         self.assertEqual(plain["B7"].value, "ca. 08:26:20")
         self.assertEqual([c.value for c in timed[3]],
                          ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Sammenlagt tidsforbruk",
-                          "Navn", "Klasse", "Klubb"])
+                          "Navn", "Klasse", "Program", "Klubb"])
         self.assertEqual([c.value for c in timed[5]], [1, "08:19:00", "-", "08:22:40", "00:03:10",
-                                                       "00:03:40", "Løper1 Test", None, "Loddefjord IL"])
+                                                       "00:03:40", "Løper1 Test", None, "Friløp",
+                                                       "Loddefjord IL"])
 
     def test_moved_water_pause_keeps_its_place_until_count_changes(self):
         items = layout_items(self.runners(4), 2, 2, 1)
@@ -506,6 +507,17 @@ class RegressionTests(unittest.TestCase):
         items = layout_items([self.runner("A", Klasse="Springs")], 1, 8, 0)
         entries = build_startliste(items, 190, datetime(2000, 1, 1, 8, 0))
         self.assertEqual([e["klasse"] for e in entries], ["", "Springs"])
+
+    def test_startliste_has_program_column_instead_of_suffix(self):
+        row = self.runner("A", Ovelse="Kortprogram+Friløp")
+        items = layout_items(split_segments([row]), 1, 8, 0)
+        entries = build_startliste(items, 190, datetime(2000, 1, 1, 8, 0))
+        self.assertEqual([(e["navn"], e["program"]) for e in entries[1:]],
+                         [("A Test", "Kortprogram"), ("A Test", "Friløp")])
+
+    def test_fp_in_filename_is_free_skate(self):
+        self.assertEqual(parse_music_path("Andjelija_Grabyte_FP.mp3")["segment"], "FS")
+        self.assertEqual(parse_music_path("Frida_Qianlu_He_SP.mp3")["segment"], "SP")
 
     def test_sorting_keeps_cancelled_runners_out_of_active_slots(self):
         app = App.__new__(App)

@@ -157,14 +157,15 @@ def add_missing_segments(items):
 
 def parse_music_path(filename):
     # Musikktjenesten: <stevne>/<Klasse_Kjønn>/<SP|FS>/<Fornavn_Etternavn>_<SP|FS>.mp3
+    # _FP (friprogram) godtas som friløp.
     path = PurePosixPath(filename)
-    match = re.match(r"(.+)_(SP|FS)$", path.stem, re.IGNORECASE)
+    match = re.match(r"(.+)_(SP|FS|FP)$", path.stem, re.IGNORECASE)
     if not match:
         return None
     parts = path.parts
     return {
         "name": normalize_text(match.group(1).replace("_", " ")),
-        "segment": match.group(2).upper(),
+        "segment": "SP" if match.group(2).upper() == "SP" else "FS",
         "category": normalize_text(parts[-3].replace("_", " ")) if len(parts) >= 3 else "",
     }
 
@@ -1054,6 +1055,7 @@ def build_startliste(
                 "nr": nr,
                 "navn": navn,
                 "klasse": row.get("Klasse", "") if kind == "run" else "",
+                "program": SEGMENT_NAMES.get(row.get("Segment") or "FS", "") if kind == "run" else "",
                 "klubb": klubb,
                 "row": row,
             }
@@ -1071,7 +1073,8 @@ def build_startliste(
             nr += 1
             # LopLengde (sekunder) overstyrer standard lengde på løp for én utøver.
             run = item.get("LopLengde") or run_seconds
-            add("run", run + ready_seconds, nr, run_name(item), item.get("Organisation", ""), item, run)
+            # Programmet har egen kolonne, så navnet står uten «– Kortprogram».
+            add("run", run + ready_seconds, nr, display_name(item), item.get("Organisation", ""), item, run)
     return entries
 
 
@@ -1093,7 +1096,7 @@ def generate_startliste_excel(entries, out_path, title, log):
         ws.append([title])
         ws.append([])
         headers = (["Nr.", "Start", "", "Slutt", "Lengde på løp"]
-                   + (["Sammenlagt tidsforbruk"] if with_duration else []) + ["Navn", "Klasse", "Klubb"])
+                   + (["Sammenlagt tidsforbruk"] if with_duration else []) + ["Navn", "Klasse", "Program", "Klubb"])
         ws.append(headers)
         for cell in ws[3]:
             cell.font = bold
@@ -1108,13 +1111,13 @@ def generate_startliste_excel(entries, out_path, title, log):
                     start = f"ca. {start}"
             duration = [entry["duration"]] if with_duration else []
             ws.append([entry["nr"], start, "-", entry["end"], entry["run_length"]] + duration
-                      + [entry["navn"], entry["klasse"], entry["klubb"]])
+                      + [entry["navn"], entry["klasse"], entry["program"], entry["klubb"]])
             if entry["is_group"]:
                 for cell in ws[ws.max_row]:
                     cell.font = bold
                     cell.fill = group_fill
 
-        widths = [6, 10, 3, 10, 14] + ([22] if with_duration else []) + [38, 18, 16]
+        widths = [6, 10, 3, 10, 14] + ([22] if with_duration else []) + [38, 18, 13, 16]
         for idx, width in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = width
         ws.append([])
@@ -1169,14 +1172,14 @@ def generate_startliste_pdf(entries, out_path, title, log):
     # De lange overskriftene brytes over to linjer.
     head_style = ParagraphStyle("HeadCell", fontName=font_name, fontSize=11, leading=12, alignment=1)
     data = [["Nr.", "Start", "", "Slutt", Paragraph("Lengde på løp", head_style),
-             Paragraph("Sammenlagt tidsforbruk", head_style), "Navn", "Klasse", "Klubb"]]
+             Paragraph("Sammenlagt tidsforbruk", head_style), "Navn", "Klasse", "Program", "Klubb"]]
     for entry in entries:
         # Paragraph tolker tekst som markup, så & og < i navn må escapes.
         name_cell = Paragraph(xml_escape(entry["navn"]), body_style)
         class_cell = Paragraph(xml_escape(entry["klasse"]), body_style)
         club_cell = Paragraph(xml_escape(entry["klubb"]), body_style)
         data.append([entry["nr"], entry["start"], "-", entry["end"], entry["run_length"], entry["duration"],
-                     name_cell, class_cell, club_cell])
+                     name_cell, class_cell, entry["program"], club_cell])
 
     doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
@@ -1190,7 +1193,8 @@ def generate_startliste_pdf(entries, out_path, title, log):
     generated_ts = format_generated_ts()
     story = [Paragraph(xml_escape(title), title_style), Spacer(1, 8)]
 
-    col_widths = [26, 48, 10, 48, 50, 62, 120, 70, 89]
+    # Sum 523 = A4-bredde (595) minus margene (2 × 36).
+    col_widths = [26, 48, 10, 48, 44, 56, 105, 62, 62, 62]
     table = Table(data, repeatRows=1, colWidths=col_widths)
     style_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#ADADAD")),
@@ -1758,6 +1762,7 @@ class App:
             "tid": ("Sammenlagt tidsforbruk", 170, "center"),
             "navn": ("Navn", 260, "w"),
             "klasse": ("Klasse", 140, "w"),
+            "program": ("Program", 110, "w"),
             "klubb": ("Klubb", 200, "w"),
         }
         # Flere rader kan merkes (Ctrl/Shift+klikk) for å sette klasse på alle; dra flytter én rad.
@@ -2196,7 +2201,7 @@ class App:
             run_length = entry["run_length"] + (" *" if entry["custom_length"] else "")
             tree.insert("", "end", iid=iid, tags=tags, values=(
                 entry["nr"], entry["start"], "-", entry["end"], run_length, entry["duration"],
-                entry["navn"], entry["klasse"], entry["klubb"],
+                entry["navn"], entry["klasse"], entry["program"], entry["klubb"],
             ))
         if select_iid:
             tree.selection_set(select_iid)
