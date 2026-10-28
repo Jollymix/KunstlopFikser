@@ -1095,8 +1095,10 @@ def generate_startliste_excel(entries, out_path, title, log):
     def write_sheet(ws, with_duration):
         ws.append([title])
         ws.append([])
-        headers = (["Nr.", "Start", "", "Slutt", "Lengde på løp"]
-                   + (["Sammenlagt tidsforbruk"] if with_duration else []) + ["Navn", "Klasse", "Program", "Klubb"])
+        # Lengde på løp og sammenlagt tidsforbruk står bare på arket «Med tidsforbruk».
+        headers = (["Nr.", "Start", "", "Slutt"]
+                   + (["Lengde på løp", "Sammenlagt tidsforbruk"] if with_duration else [])
+                   + ["Navn", "Klasse", "Program", "Klubb"])
         ws.append(headers)
         for cell in ws[3]:
             cell.font = bold
@@ -1109,15 +1111,15 @@ def generate_startliste_excel(entries, out_path, title, log):
                 group += 1
                 if group > 1:
                     start = f"ca. {start}"
-            duration = [entry["duration"]] if with_duration else []
-            ws.append([entry["nr"], start, "-", entry["end"], entry["run_length"]] + duration
+            duration = [entry["run_length"], entry["duration"]] if with_duration else []
+            ws.append([entry["nr"], start, "-", entry["end"]] + duration
                       + [entry["navn"], entry["klasse"], entry["program"], entry["klubb"]])
             if entry["is_group"]:
                 for cell in ws[ws.max_row]:
                     cell.font = bold
                     cell.fill = group_fill
 
-        widths = [6, 10, 3, 10, 14] + ([22] if with_duration else []) + [38, 18, 13, 16]
+        widths = [6, 10, 3, 10] + ([14, 22] if with_duration else []) + [38, 18, 13, 16]
         for idx, width in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = width
         ws.append([])
@@ -1182,10 +1184,10 @@ def generate_startliste_pdf(entries, out_path, title, log):
         font_name, bold_name = "Helvetica", "Helvetica-Bold"
 
     # (nøkkel, overskrift, overskriften kan brytes, tekstkolonne som kan brytes ved behov).
+    # Lengde på løp og sammenlagt tidsforbruk står bare i Excel-arket «Med tidsforbruk».
     columns = [
         ("nr", "Nr.", False, False), ("start", "Start", False, False), ("dash", "", False, False),
-        ("end", "Slutt", False, False), ("run_length", "Lengde på løp", True, False),
-        ("duration", "Sammenlagt tidsforbruk", True, False), ("navn", "Navn", False, True),
+        ("end", "Slutt", False, False), ("navn", "Navn", False, True),
         ("klasse", "Klasse", False, True), ("program", "Program", False, False), ("klubb", "Klubb", False, True),
     ]
     # Klasse og klubb tas bare med når noen har det (Spond har f.eks. ikke klubb).
@@ -1252,7 +1254,7 @@ def generate_startliste_pdf(entries, out_path, title, log):
         ("FONTNAME", (0, 1), (-1, -1), font_name),
         ("FONTSIZE", (0, 0), (-1, 0), size + 1),
         ("FONTSIZE", (0, 1), (-1, -1), size),
-        ("ALIGN", (0, 0), (5, -1), "CENTER"),
+        ("ALIGN", (0, 0), (3, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 1),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),

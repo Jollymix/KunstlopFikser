@@ -232,9 +232,9 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(wb.sheetnames, ["Startliste", "Med tidsforbruk"])
         plain, timed = wb["Startliste"], wb["Med tidsforbruk"]
         self.assertEqual([c.value for c in plain[3]],
-                         ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Navn", "Klasse", "Program", "Klubb"])
+                         ["Nr.", "Start", None, "Slutt", "Navn", "Klasse", "Program", "Klubb"])
         self.assertEqual([c.value for c in plain[4]][1:4], ["08:15:00", "-", "08:19:00"])
-        self.assertEqual(plain["F4"].value, "Oppvarmingsgruppe 1")
+        self.assertEqual(plain["E4"].value, "Oppvarmingsgruppe 1")
         self.assertEqual(plain["B7"].value, "ca. 08:26:20")
         self.assertEqual([c.value for c in timed[3]],
                          ["Nr.", "Start", None, "Slutt", "Lengde på løp", "Sammenlagt tidsforbruk",
