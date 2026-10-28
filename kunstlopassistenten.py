@@ -1142,9 +1142,22 @@ def generate_startliste_excel(entries, out_path, title, log):
     return True
 
 
+def fit_columns(natural, flexible, available):
+    # Kolonnebredder som fyller tilgjengelig bredde. Er det plass til overs, får første fleksible
+    # kolonne (navn) den. Er det for trangt, krympes de fleksible kolonnene (navn, klasse, klubb)
+    # relativt like mye, så bare de brytes.
+    total = sum(natural)
+    if total <= available:
+        widths = list(natural)
+        widths[flexible[0]] += available - total
+        return widths
+    flex_total = sum(natural[i] for i in flexible)
+    return [w - (total - available) * w / flex_total if i in flexible else w for i, w in enumerate(natural)]
+
+
 def generate_startliste_pdf(entries, out_path, title, log):
     try:
-        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.pagesizes import A4, landscape
         from reportlab.lib import colors
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -1163,25 +1176,57 @@ def generate_startliste_pdf(entries, out_path, title, log):
     except Exception:
         font_name = "Helvetica"
 
-    body_style = ParagraphStyle(
-        "BodyCell",
-        fontName=font_name,
-        fontSize=10,
-        leading=11,
-    )
-    # De lange overskriftene brytes over to linjer.
-    head_style = ParagraphStyle("HeadCell", fontName=font_name, fontSize=11, leading=12, alignment=1)
-    data = [["Nr.", "Start", "", "Slutt", Paragraph("Lengde på løp", head_style),
-             Paragraph("Sammenlagt tidsforbruk", head_style), "Navn", "Klasse", "Program", "Klubb"]]
+    # (nøkkel, overskrift, overskriften kan brytes, tekstkolonne som kan brytes ved behov).
+    columns = [
+        ("nr", "Nr.", False, False), ("start", "Start", False, False), ("dash", "", False, False),
+        ("end", "Slutt", False, False), ("run_length", "Lengde på løp", True, False),
+        ("duration", "Sammenlagt tidsforbruk", True, False), ("navn", "Navn", False, True),
+        ("klasse", "Klasse", False, True), ("program", "Program", False, False), ("klubb", "Klubb", False, True),
+    ]
+    # Klasse og klubb tas bare med når noen har det (Spond har f.eks. ikke klubb).
+    columns = [c for c in columns if c[0] not in ("klasse", "klubb") or any(e[c[0]] for e in entries)]
+
+    def value(entry, key):
+        return "-" if key == "dash" else str(entry[key])
+
+    pad = 4
+
+    def natural_widths(size):
+        # Bredden hver kolonne trenger uten linjeskift; overskrifter kan brytes mellom ordene.
+        widths = []
+        for key, header, wrap_header, is_text in columns:
+            words = header.split() if wrap_header else [header]
+            width = max(pdfmetrics.stringWidth(w, font_name, size + 1) for w in words)
+            for entry in entries:
+                text = value(entry, key)
+                width = max(width, pdfmetrics.stringWidth(text, font_name, size))
+                if not is_text:
+                    # Tider i gruppe-radene skrives med fet skrift.
+                    width = max(width, pdfmetrics.stringWidth(text, "Helvetica-Bold", size))
+            widths.append(width + 2 * pad + 2)
+        return widths
+
+    # Stående A4 med 10 pt, så stående med 9 pt, og liggende A4 hvis det fortsatt er for trangt.
+    margin = 36
+    for pagesize, size in ((A4, 10), (A4, 9), (landscape(A4), 10)):
+        natural = natural_widths(size)
+        if sum(natural) <= pagesize[0] - 2 * margin:
+            break
+    flexible = [i for i, c in enumerate(columns) if c[3]]
+    col_widths = fit_columns(natural, flexible, pagesize[0] - 2 * margin)
+    body_style = ParagraphStyle("BodyCell", fontName=font_name, fontSize=size, leading=size + 1)
+    head_style = ParagraphStyle("HeadCell", fontName=font_name, fontSize=size + 1, leading=size + 2,
+                                alignment=1)
+
+    data = [[Paragraph(header, head_style) if wrap_header else header
+             for _, header, wrap_header, _ in columns]]
     for entry in entries:
         # Paragraph tolker tekst som markup, så & og < i navn må escapes.
-        name_cell = Paragraph(xml_escape(entry["navn"]), body_style)
-        class_cell = Paragraph(xml_escape(entry["klasse"]), body_style)
-        club_cell = Paragraph(xml_escape(entry["klubb"]), body_style)
-        data.append([entry["nr"], entry["start"], "-", entry["end"], entry["run_length"], entry["duration"],
-                     name_cell, class_cell, entry["program"], club_cell])
+        data.append([Paragraph(xml_escape(value(entry, key)), body_style) if is_text else value(entry, key)
+                     for key, _, _, is_text in columns])
 
-    doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    doc = SimpleDocTemplate(out_path, pagesize=pagesize, leftMargin=margin, rightMargin=margin,
+                            topMargin=margin, bottomMargin=margin)
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
         "StartTitle",
@@ -1193,15 +1238,15 @@ def generate_startliste_pdf(entries, out_path, title, log):
     generated_ts = format_generated_ts()
     story = [Paragraph(xml_escape(title), title_style), Spacer(1, 8)]
 
-    # Sum 523 = A4-bredde (595) minus margene (2 × 36).
-    col_widths = [26, 48, 10, 48, 44, 56, 105, 62, 62, 62]
     table = Table(data, repeatRows=1, colWidths=col_widths)
     style_cmds = [
+        ("LEFTPADDING", (0, 0), (-1, -1), pad),
+        ("RIGHTPADDING", (0, 0), (-1, -1), pad),
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#ADADAD")),
         ("FONTNAME", (0, 0), (-1, 0), font_name),
         ("FONTNAME", (0, 1), (-1, -1), font_name),
-        ("FONTSIZE", (0, 0), (-1, 0), 11),
-        ("FONTSIZE", (0, 1), (-1, -1), 10),
+        ("FONTSIZE", (0, 0), (-1, 0), size + 1),
+        ("FONTSIZE", (0, 1), (-1, -1), size),
         ("ALIGN", (0, 0), (5, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 1),

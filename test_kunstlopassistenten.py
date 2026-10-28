@@ -23,7 +23,9 @@ from kunstlopassistenten import (
     export_setup_package,
     extract_setup_package,
     find_music_for_row,
+    fit_columns,
     generate_startliste_excel,
+    generate_startliste_pdf,
     generate_vlc_playlist,
     get_audio_duration,
     group_overflows,
@@ -514,6 +516,20 @@ class RegressionTests(unittest.TestCase):
         entries = build_startliste(items, 190, datetime(2000, 1, 1, 8, 0))
         self.assertEqual([(e["navn"], e["program"]) for e in entries[1:]],
                          [("A Test", "Kortprogram"), ("A Test", "Friløp")])
+
+    def test_pdf_columns_fill_width_and_only_text_columns_shrink(self):
+        self.assertEqual(fit_columns([20, 50, 100], [2], 200), [20, 50, 130])
+        widths = fit_columns([20, 50, 100, 100], [2, 3], 220)
+        self.assertEqual(widths[:2], [20, 50])
+        self.assertAlmostEqual(sum(widths), 220)
+
+    def test_startliste_pdf_is_written_without_club_column(self):
+        items = layout_items([self.runner("Alejandra Bailador", "Hognestad", Klasse="Oppvisning-cubs")], 1, 8, 0)
+        entries = build_startliste(items, 190, datetime(2000, 1, 1, 8, 0))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "startliste.pdf"
+            self.assertTrue(generate_startliste_pdf(entries, str(path), "Tittel", Mock()))
+            self.assertTrue(path.read_bytes().startswith(b"%PDF"))
 
     def test_fp_in_filename_is_free_skate(self):
         self.assertEqual(parse_music_path("Andjelija_Grabyte_FP.mp3")["segment"], "FS")
