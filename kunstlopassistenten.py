@@ -1157,7 +1157,18 @@ def fit_columns(natural, flexible, available):
     return [w - (total - available) * w / flex_total if i in flexible else w for i, w in enumerate(natural)]
 
 
-def generate_startliste_pdf(entries, out_path, title, log):
+# Kolonner som kan velges i startliste-PDF-en: (nøkkel, tekst i valgdialogen, med som standard).
+STARTLISTE_PDF_COLUMNS = [
+    ("nr", "Nr.", True), ("start", "Start", True), ("end", "Slutt", True),
+    ("run_length", "Lengde på løp", False), ("duration", "Sammenlagt tidsforbruk", False),
+    ("navn", "Navn", True), ("klasse", "Klasse", True), ("program", "Program", True), ("klubb", "Klubb", True),
+]
+
+
+def generate_startliste_pdf(entries, out_path, title, log, keys=None):
+    # keys: kolonnene som skal med (se STARTLISTE_PDF_COLUMNS); None gir standardutvalget.
+    if keys is None:
+        keys = [key for key, _, default in STARTLISTE_PDF_COLUMNS if default]
     try:
         from reportlab.lib.pagesizes import A4, landscape
         from reportlab.lib import colors
@@ -1184,14 +1195,22 @@ def generate_startliste_pdf(entries, out_path, title, log):
         font_name, bold_name = "Helvetica", "Helvetica-Bold"
 
     # (nøkkel, overskrift, overskriften kan brytes, tekstkolonne som kan brytes ved behov).
-    # Lengde på løp og sammenlagt tidsforbruk står bare i Excel-arket «Med tidsforbruk».
     columns = [
         ("nr", "Nr.", False, False), ("start", "Start", False, False), ("dash", "", False, False),
-        ("end", "Slutt", False, False), ("navn", "Navn", False, True),
+        ("end", "Slutt", False, False), ("run_length", "Lengde på løp", True, False),
+        ("duration", "Sammenlagt tidsforbruk", True, False), ("navn", "Navn", False, True),
         ("klasse", "Klasse", False, True), ("program", "Program", False, False), ("klubb", "Klubb", False, True),
     ]
+    # Streken mellom start og slutt står bare når begge er med.
+    selected = set(keys) | ({"dash"} if {"start", "end"} <= set(keys) else set())
     # Klasse og klubb tas bare med når noen har det (Spond har f.eks. ikke klubb).
-    columns = [c for c in columns if c[0] not in ("klasse", "klubb") or any(e[c[0]] for e in entries)]
+    columns = [c for c in columns if c[0] in selected
+               and (c[0] not in ("klasse", "klubb") or any(e[c[0]] for e in entries))]
+    if not columns:
+        log("Ingen kolonner valgt for startliste-PDF.")
+        return False
+    centered = [i for i, c in enumerate(columns)
+                if c[0] in ("nr", "start", "dash", "end", "run_length", "duration")]
 
     def value(entry, key):
         return "-" if key == "dash" else str(entry[key])
@@ -1219,7 +1238,8 @@ def generate_startliste_pdf(entries, out_path, title, log):
         natural = natural_widths(size)
         if sum(natural) <= pagesize[0] - 2 * margin:
             break
-    flexible = [i for i, c in enumerate(columns) if c[3]]
+    # Uten tekstkolonner får siste kolonne plassen som er til overs.
+    flexible = [i for i, c in enumerate(columns) if c[3]] or [len(columns) - 1]
     col_widths = fit_columns(natural, flexible, pagesize[0] - 2 * margin)
     body_style = ParagraphStyle("BodyCell", fontName=font_name, fontSize=size, leading=size + 1)
     head_style = ParagraphStyle("HeadCell", fontName=font_name, fontSize=size + 1, leading=size + 2,
@@ -1254,7 +1274,7 @@ def generate_startliste_pdf(entries, out_path, title, log):
         ("FONTNAME", (0, 1), (-1, -1), font_name),
         ("FONTSIZE", (0, 0), (-1, 0), size + 1),
         ("FONTSIZE", (0, 1), (-1, -1), size),
-        ("ALIGN", (0, 0), (3, -1), "CENTER"),
+        *[("ALIGN", (i, 0), (i, -1), "CENTER") for i in centered],
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("TOPPADDING", (0, 0), (-1, -1), 1),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
@@ -4065,12 +4085,52 @@ class App:
         if not result:
             return
         title, base_name = result
+        keys = self.ask_startliste_columns()
+        if not keys:
+            return
         out_dir = self.output_dir()
         results = {
             "Excel": generate_startliste_excel(self.entries, str(out_dir / f"{base_name}.xlsx"), title, self.log),
-            "PDF": generate_startliste_pdf(self.entries, str(out_dir / f"{base_name}.pdf"), title, self.log),
+            "PDF": generate_startliste_pdf(self.entries, str(out_dir / f"{base_name}.pdf"), title, self.log,
+                                           keys),
         }
         self.report_export(results, out_dir, "Startliste ferdig", "Startlisten er lagret i:")
+
+    def ask_startliste_columns(self):
+        # Valgene huskes til neste gang i samme økt.
+        if not hasattr(self, "startliste_column_vars"):
+            self.startliste_column_vars = {
+                key: tk.BooleanVar(value=default) for key, _, default in STARTLISTE_PDF_COLUMNS
+            }
+        chosen = []
+        win = tk.Toplevel(self.root, bg=BG)
+        win.title("Kolonner i startlisten")
+        win.resizable(False, False)
+        win.transient(self.root)
+        style_window_frame(win)
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Velg kolonnene som skal med i PDF-utskriften:").pack(anchor="w", pady=(0, 8))
+        for key, label, _ in STARTLISTE_PDF_COLUMNS:
+            ttk.Checkbutton(frame, text=label, variable=self.startliste_column_vars[key]).pack(anchor="w")
+
+        def ok():
+            keys = [key for key, _, _ in STARTLISTE_PDF_COLUMNS if self.startliste_column_vars[key].get()]
+            if not keys:
+                messagebox.showinfo("Kolonner i startlisten", "Minst én kolonne må være med.", parent=win)
+                return
+            chosen.extend(keys)
+            win.destroy()
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Lagre", style="Accent.TButton", command=ok).pack(side="right")
+        ttk.Button(btns, text="Avbryt", command=win.destroy).pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda _e: ok())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.grab_set()
+        self.root.wait_window(win)
+        return chosen
 
     def generate_playlist_only(self):
         active = self.active_rows()
