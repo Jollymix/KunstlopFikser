@@ -1972,6 +1972,8 @@ class App:
         self.tree.tag_configure("audio_error", foreground=BAD, background="#3B1D24")
         self.tree.tag_configure("cancelled", foreground=TEXT_DISABLED)
         self.tree.tag_configure("completed", foreground=GOOD, background="#16302A")
+        self.tree.tag_configure("warmup", background=GROUP_BG, font=self.fonts["bold"])
+        self.tree.tag_configure("pause", background=GROUP_BG, foreground=WARN, font=self.fonts["bold"])
         self.tree.bind("<Button-1>", self.on_tree_checkbox_click)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<Button-3>", self.on_tree_right_click)
@@ -3180,8 +3182,7 @@ class App:
         if not selected:
             return None
         index = self.tree.index(selected[0])
-        rows = self.rows
-        return rows[index] if index < len(rows) else None
+        return self.items[index] if index < len(self.items) else None
 
     def on_tree_right_click(self, event):
         item_id = self.tree.identify_row(event.y)
@@ -3191,7 +3192,9 @@ class App:
         self.tree.selection_set(item_id)
         self.tree.focus(item_id)
         row = self.selected_table_row()
-        self.tree_menu.entryconfigure(1, state="normal" if row and row.get("MusikkFil") else "disabled")
+        if row is None or is_marker(row):
+            return
+        self.tree_menu.entryconfigure(1, state="normal" if row.get("MusikkFil") else "disabled")
         try:
             self.tree_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -3239,7 +3242,15 @@ class App:
         has_music = bool(self.music_files) or any(r.get("MusikkManuell") for r in self.rows)
         rows_values = []
         nr = 1
-        for row in self.rows:
+        # Tabellen har én rad per element i self.items, også oppvarmingsgrupper og vanningspauser.
+        entries = {id(entry["row"]): entry for entry in self.entries}
+        for row in self.items:
+            if is_marker(row):
+                entry = entries.get(id(row), {})
+                values = ("", "", entry.get("start", ""), entry.get("navn", "")) + ("",) * 8
+                rows_values.append(values)
+                self.tree.insert("", "end", values=values, tags=(row["Kind"],))
+                continue
             cancelled = is_cancelled(row.get("Påmelding", ""))
             missing = has_music and not row.get("MusikkFil")
             if cancelled:
@@ -3337,10 +3348,12 @@ class App:
         if not item_id:
             return "break"
         row_index = self.tree.index(item_id)
-        if row_index < 0 or row_index >= len(self.rows):
+        if row_index < 0 or row_index >= len(self.items):
             return "break"
 
-        row = self.rows[row_index]
+        row = self.items[row_index]
+        if is_marker(row):
+            return "break"
         self.tree.selection_set(item_id)
         self.tree.focus(item_id)
         completed = bool(row.get("LopGjennomfort"))
@@ -3381,7 +3394,9 @@ class App:
         item_id = self.tree.identify_row(event.y)
         if not item_id:
             return
-        self.play_mp3_file(self.rows[self.tree.index(item_id)].get("MusikkFil", ""))
+        row = self.items[self.tree.index(item_id)]
+        if not is_marker(row):
+            self.play_mp3_file(row.get("MusikkFil", ""))
 
     # -------------------- Avspilling --------------------
     def get_cached_mp3_path(self, filename, quiet=False):
@@ -3604,7 +3619,7 @@ class App:
         selected = self.tree.selection()
         if not selected:
             return ""
-        return self.rows[self.tree.index(selected[0])].get("MusikkFil", "")
+        return self.items[self.tree.index(selected[0])].get("MusikkFil", "")
 
     def toggle_play_pause(self):
         if self.use_external_player_var.get():
