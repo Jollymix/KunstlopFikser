@@ -1551,6 +1551,8 @@ class App:
         s.configure("TCheckbutton", background=PANEL, foreground=TEXT, indicatorbackground=FIELD,
                     indicatorforeground=ACCENT)
         s.map("TCheckbutton", background=[("active", PANEL)], indicatorbackground=[("selected", FIELD)])
+        s.configure("Player.TCheckbutton", background=FIELD)
+        s.map("Player.TCheckbutton", background=[("active", FIELD)])
 
         s.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0),
                     bordercolor=BG, lightcolor=BG, darkcolor=BG)
@@ -1937,8 +1939,6 @@ class App:
             side="left", padx=(8, 0))
         ttk.Button(bar, text="Lag spilleliste", command=self.generate_playlist_only).pack(
             side="left", padx=(8, 0))
-        ttk.Checkbutton(bar, text="Bruk VLC direkte", variable=self.use_external_player_var,
-                        command=self.on_use_external_player_toggle).pack(side="left", padx=(16, 0))
         self.music_info_var = tk.StringVar(value="Ingen musikk-zip valgt.")
         ttk.Label(bar, textvariable=self.music_info_var, style="PanelDim.TLabel").pack(
             side="left", padx=(16, 0))
@@ -2049,8 +2049,15 @@ class App:
         self.wave_canvas.bind("<B1-Motion>", self.on_waveform_drag)
         self.wave_canvas.bind("<ButtonRelease-1>", self.on_waveform_release)
         self.player_track_var = tk.StringVar(value="Ingen spor valgt")
-        ttk.Label(card, textvariable=self.player_track_var, background=FIELD,
-                  foreground=TEXT_DIM, font=self.fonts["small"]).pack(anchor="w", pady=(8, 0))
+        footer = tk.Frame(card, bg=FIELD)
+        footer.pack(fill="x", pady=(8, 0))
+        ttk.Label(footer, textvariable=self.player_track_var, background=FIELD,
+                  foreground=TEXT_DIM, font=self.fonts["small"]).pack(side="left")
+        # Står i avspilleren, så valget også finnes i stevnemodus. Ikke i Tab-rekkefølgen:
+        # mellomrom skal aldri kunne bytte avspiller under et løp.
+        ttk.Checkbutton(footer, text="Bruk VLC direkte", style="Player.TCheckbutton", takefocus=False,
+                        variable=self.use_external_player_var,
+                        command=self.on_use_external_player_toggle).pack(side="right")
         self.play_pause_text.trace_add("write", lambda *_: self.draw_player_button("play"))
         for name in self.player_buttons:
             self.draw_player_button(name)
@@ -3769,6 +3776,14 @@ class App:
 
     def on_use_external_player_toggle(self):
         # Pågående avspilling stoppes ved modusbytte, så ingen lyd spiller uten at den kan styres.
+        # I stevnemodus må det bekreftes, så et feilklikk ikke stopper musikken midt i et løp.
+        if self.competition_mode and self.current_track and not messagebox.askyesno(
+            "Bytte avspiller",
+            "Musikken stopper hvis du bytter avspiller nå. Vil du bytte?",
+            parent=self.root,
+        ):
+            self.use_external_player_var.set(not self.use_external_player_var.get())
+            return
         self.player_enabled = not self.use_external_player_var.get()
         self.reset_player()
         for name in self.player_buttons:

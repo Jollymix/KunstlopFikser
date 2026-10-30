@@ -711,6 +711,7 @@ class PlayerTests(unittest.TestCase):
         app.external_playback = False
         app.player_enabled = True
         app.seek_supported = True
+        app.competition_mode = False
         app.use_external_player_var = FakeVariable(False)
         app.current_track = "sang.mp3"
         app.current_duration = 120
@@ -745,6 +746,31 @@ class PlayerTests(unittest.TestCase):
         self.assertFalse(app.player_enabled)
         self.assertEqual(app.current_track, "")
         self.assertEqual(app.player_time_var.get(), "VLC direkte")
+
+    def test_vlc_toggle_in_competition_mode_can_be_cancelled(self):
+        app = self.make_app()
+        app.competition_mode = True
+        app.use_external_player_var.set(True)
+
+        with patch("kunstlopassistenten.messagebox.askyesno", return_value=False) as askyesno:
+            app.on_use_external_player_toggle()
+
+        askyesno.assert_called_once()
+        app.music.stop.assert_not_called()
+        self.assertFalse(app.use_external_player_var.get())
+        self.assertEqual(app.current_track, "sang.mp3")
+
+    def test_vlc_toggle_in_competition_mode_without_music_asks_nothing(self):
+        app = self.make_app()
+        app.competition_mode = True
+        app.current_track = ""
+        app.use_external_player_var.set(True)
+
+        with patch("kunstlopassistenten.messagebox.askyesno") as askyesno:
+            app.on_use_external_player_toggle()
+
+        askyesno.assert_not_called()
+        self.assertFalse(app.player_enabled)
 
     def test_vlc_text_is_not_overwritten_by_old_time(self):
         app = self.make_app()
