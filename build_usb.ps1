@@ -15,9 +15,13 @@ $version = (git rev-parse --short HEAD 2>$null)
 if (-not $version) { $version = Get-Date -Format "yyyy-MM-dd" }
 Set-Content -Path "version.txt" -Value $version -Encoding utf8
 
+# Logoen er ikke i git (*.jpg ignoreres), saa den tas bare med hvis den finnes
+$logoArgs = @()
+if (Test-Path "Lil Logo.jpg") { $logoArgs = @("--add-data", "Lil Logo.jpg;.") }
+
 & $python -m PyInstaller --noconfirm --clean --onedir --windowed `
     --name Kunstlopassistenten `
-    --add-data "Lil Logo.jpg;." `
+    @logoArgs `
     --add-data "version.txt;." `
     --hidden-import babel.numbers `
     kunstlopassistenten.py
