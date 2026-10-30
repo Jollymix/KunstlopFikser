@@ -1,0 +1,41 @@
+# Bygger USB-versjonen og legger den ut som release naar en versjonstagg pushes:
+#   git tag v1.0; git push --tags
+name: Release USB-versjon
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Bygg exe
+        shell: pwsh
+        run: ./build_usb.ps1
+
+      - name: Pakk zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/Kunstlopassistenten -DestinationPath Kunstlopassistenten.zip
+
+      - name: Lag release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Kunstlopassistenten.zip
+          body: |
+            USB-versjon av Kunstløpassistenten. Krever ikke Python.
+
+            1. Last ned `Kunstlopassistenten.zip` og pakk den ut på USB-pinnen.
+            2. Start `Kunstlopassistenten\Kunstlopassistenten.exe`.
+
+            Første gang kan Windows SmartScreen advare: velg «Mer info» → «Kjør likevel».

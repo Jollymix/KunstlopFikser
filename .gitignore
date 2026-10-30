@@ -12,6 +12,10 @@ __pycache__/
 
 # Output / temp
 output/
+build/
+dist/
+*.spec
+version.txt
 _tmp_xml/
 
 # Generated output (never commit)
