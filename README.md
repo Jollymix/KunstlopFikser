@@ -1,6 +1,6 @@
 # Kunstløpassistenten
 
-Et program for å lage tidsplan og startliste til kunstløpstevner, og for å spille musikken under stevnet.
+Et program for kunstløpstevner. Det leser deltakerlister fra **isonen** og musikk fra **NSF sin musikkside ([nsfcompetition.no](https://nsfcompetition.no/))**, lager tidsskjema og startliste, og spiller musikken i riktig rekkefølge under stevnet.
 
 ## Last ned
 
@@ -21,18 +21,25 @@ Du trenger ikke installere noe annet.
 
 ![Stevne](docs/skjermbilde_stevne.png)
 
-## Hva programmet gjør
+## Hva kan programmet brukes til?
 
-- **Tidsplan/planlegging**: Hent deltakerlisten fra isonen, eller legg inn utøvere selv for mindre stevner. Sett starttid, lengde på løp, klart til neste løp, oppvarming og vanningspauser. Dra rader med musen, så oppdateres tidene med en gang. Oppsettet lagres i en egen fil, og startlisten eksporteres til Excel og PDF.
-- **Stevne**: Stor klokke, musikk fra musikktjenesten som spilles av i programmet eller i VLC, og avkrysning av løp som er gjennomført.
+- **Interne stevner og prøvestevner:** Lag et tidsskjema på noen minutter. Hent utøverne fra isonen eller Spond, eller skriv dem inn selv. Velg starttid, lengde på løp, oppvarmingsgrupper og vanningspauser, så regner programmet ut alle tidene. Dra utøverne med musen for å endre rekkefølgen. Startlisten lagres som Excel og PDF.
+- **Stevner med offisielt tidsskjema fra Norges Skøyteforbund:** Hent utøverne og musikken fra isonen og nsfcompetition.no, og sett dem i samme rekkefølge som tidsskjemaet fra forbundet. Da ligger musikken klar i riktig rekkefølge når stevnet starter.
+- **Under stevnet:** Stor klokke, musikken spilles rett fra programmet (eller i VLC), og du krysser av hvert løp som er gjennomført.
 
-Til et stevne trengs tre filer (eller velg «Skann mappe» på mappen der de ligger):
+## Filer programmet kan lese
 
-- `Deltakerliste*.xlsx` fra isonen.
-- `entries_*.xlsx`, deltakerlisten fra musikktjenesten. Kobles til isonen med NIF ID (= Person ID).
-- `Music*.zip` fra musikktjenesten, med lydfiler per klasse og program (`SP`/`FS`) og `music-status.csv`.
+Alt hentes fra **Fil**-menyen i programmet.
 
-Utøvere med kortprogram og friløp får ett løp for hvert program.
+| Hvor filen kommer fra | Fil | Hva den brukes til |
+|---|---|---|
+| **isonen** | `Deltakerliste….xlsx` | Utøverne som er påmeldt stevnet |
+| **NSF musikk** ([nsfcompetition.no](https://nsfcompetition.no/)) | `entries_….xlsx` | Deltakerlisten med program (kortprogram/friløp) |
+| **NSF musikk** ([nsfcompetition.no](https://nsfcompetition.no/)) | `Music….zip` | Musikken til alle utøverne |
+| **Spond** (prøvestevner) | eksportert deltakerliste (`.xlsx`) | Utøverne som har svart ja |
+| **En mappe på PC-en** (prøvestevner) | lydfiler, f.eks. `Fornavn_Etternavn_FS.mp3` | Musikken til utøverne |
+
+Utøverne fra isonen og NSF musikk kobles sammen med NIF ID, og musikken kobles til riktig utøver automatisk. Utøvere med både kortprogram og friløp får ett løp for hvert program.
 
 ## For utviklere
 
